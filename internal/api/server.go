@@ -24,12 +24,19 @@ func New(cfg *config.Config, manager *xray.Manager, process *xray.Process) *Serv
 	return &Server{cfg: cfg, manager: manager, process: process}
 }
 
+// xrayGRPC opens a short-lived gRPC connection to Xray API and returns the client.
+// Caller is responsible for calling Close(). Returns nil if Xray is not reachable.
+func (s *Server) xrayGRPC() (*xray.GRPCClient, error) {
+	return xray.NewGRPCClient(s.cfg.XrayAPIAddr)
+}
+
 func (s *Server) Run() error {
 	mux := http.NewServeMux()
 
 	// Auth middleware applied to all routes
 	mux.HandleFunc("/health", s.auth(s.handleHealth))
 	mux.HandleFunc("/metrics", s.auth(s.handleMetrics))
+	mux.HandleFunc("/version", s.auth(s.handleVersion))
 	mux.HandleFunc("/xray/status", s.auth(s.handleXrayStatus))
 	mux.HandleFunc("/xray/reload", s.auth(s.handleXrayReload))
 	mux.HandleFunc("/xray/restart", s.auth(s.handleXrayRestart))
@@ -39,6 +46,9 @@ func (s *Server) Run() error {
 	mux.HandleFunc("/clients/remove", s.auth(s.handleRemoveClient))
 	mux.HandleFunc("/clients/update", s.auth(s.handleUpdateClient))
 	mux.HandleFunc("/inbound/ensure", s.auth(s.handleEnsureInbound))
+	mux.HandleFunc("/inbound/short-ids", s.auth(s.handleUpdateShortIds))
+	mux.HandleFunc("/inbound/rollback", s.auth(s.handleRollback))
+	mux.HandleFunc("/provision", s.auth(s.handleProvision))
 
 	srv := &http.Server{
 		Addr:         s.cfg.ListenAddr,
@@ -207,6 +217,7 @@ type AddClientReq struct {
 	ID         string `json:"id"` // UUID
 	Email      string `json:"email"`
 	Flow       string `json:"flow"`
+	ShortId    string `json:"short_id"` // unique per-client REALITY shortId
 	TotalGB    int64  `json:"total_gb"`
 	ExpiryMs   int64  `json:"expiry_ms"`
 }
@@ -226,33 +237,67 @@ func (s *Server) handleAddClient(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	resp := map[string]interface{}{
+		"id":                 req.ID,
+		"email":              req.Email,
+		"runtime_sync_state": "failed",
+		"config_apply_state": "pending",
+	}
+
+	// Phase 1: runtime AddUser via Xray gRPC HandlerService (no restart).
+	grpcErr := ""
+	if gc, err := s.xrayGRPC(); err != nil {
+		grpcErr = "grpc connect: " + err.Error()
+		log.Printf("xray gRPC unavailable for AddUser email=%s: %v", req.Email, err)
+	} else {
+		defer gc.Close()
+		if err := gc.AddUser(req.InboundTag, req.ID, req.Email, req.Flow); err != nil {
+			grpcErr = err.Error()
+			log.Printf("HandlerService.AddUser failed email=%s: %v", req.Email, err)
+		} else {
+			resp["runtime_sync_state"] = "ok"
+		}
+	}
+	if grpcErr != "" {
+		resp["runtime_error"] = grpcErr
+	}
+
+	// Phase 2: persist to config.json and sync REALITY shortIds via reload.
+	// This reload is required because Xray has no runtime API to update realitySettings.shortIds.
+	// Note: reload (SIGHUP) may briefly interrupt active REALITY handshakes.
 	client := xray.VlessClient{
 		ID:         req.ID,
 		Email:      req.Email,
 		Flow:       req.Flow,
-		TotalGB:    req.TotalGB * 1024 * 1024 * 1024, // convert GB to bytes
+		ShortId:    req.ShortId,
+		TotalGB:    req.TotalGB * 1024 * 1024 * 1024,
 		ExpiryTime: req.ExpiryMs,
 		Enable:     true,
 	}
-
 	if err := s.manager.AddClient(req.InboundTag, client); err != nil {
-		jsonErr(w, 500, err.Error())
+		resp["config_apply_state"] = "failed"
+		resp["config_error"] = err.Error()
+		log.Printf("config AddClient failed email=%s: %v", req.Email, err)
+		jsonOK(w, resp)
 		return
 	}
-
 	if err := s.process.Reload(); err != nil {
-		log.Printf("xray apply after add client failed: %v", err)
-		jsonErr(w, http.StatusBadGateway, "client saved, but xray apply failed: "+err.Error())
+		resp["config_apply_state"] = "failed"
+		resp["config_error"] = err.Error()
+		log.Printf("xray reload after add client failed: %v", err)
+		jsonOK(w, resp)
 		return
 	}
+	resp["config_apply_state"] = "ok"
 
-	jsonOK(w, map[string]string{"ok": "true", "id": req.ID, "email": req.Email})
+	jsonOK(w, resp)
 }
 
 // POST /clients/remove
 type RemoveClientReq struct {
 	InboundTag string `json:"inbound_tag"`
 	ID         string `json:"id"`
+	Email      string `json:"email"` // required for runtime RemoveUser by Xray API
 }
 
 func (s *Server) handleRemoveClient(w http.ResponseWriter, r *http.Request) {
@@ -270,18 +315,50 @@ func (s *Server) handleRemoveClient(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	resp := map[string]interface{}{
+		"runtime_sync_state": "failed",
+		"config_apply_state": "pending",
+	}
+
+	// Phase 1: runtime RemoveUser via Xray gRPC HandlerService (no restart).
+	grpcErr := ""
+	if req.Email == "" {
+		grpcErr = "email required for runtime RemoveUser"
+		log.Printf("RemoveClient: email missing for runtime removal of id=%s", req.ID)
+	} else if gc, err := s.xrayGRPC(); err != nil {
+		grpcErr = "grpc connect: " + err.Error()
+		log.Printf("xray gRPC unavailable for RemoveUser email=%s: %v", req.Email, err)
+	} else {
+		defer gc.Close()
+		if err := gc.RemoveUser(req.InboundTag, req.Email); err != nil {
+			grpcErr = err.Error()
+			log.Printf("HandlerService.RemoveUser failed email=%s: %v", req.Email, err)
+		} else {
+			resp["runtime_sync_state"] = "revoked"
+		}
+	}
+	if grpcErr != "" {
+		resp["runtime_error"] = grpcErr
+	}
+
+	// Phase 2: remove from config.json and sync REALITY shortIds via reload.
 	if err := s.manager.RemoveClient(req.InboundTag, req.ID); err != nil {
-		jsonErr(w, 500, err.Error())
+		resp["config_apply_state"] = "failed"
+		resp["config_error"] = err.Error()
+		log.Printf("config RemoveClient failed id=%s: %v", req.ID, err)
+		jsonOK(w, resp)
 		return
 	}
-
 	if err := s.process.Reload(); err != nil {
-		log.Printf("xray apply after remove client failed: %v", err)
-		jsonErr(w, http.StatusBadGateway, "client removed, but xray apply failed: "+err.Error())
+		resp["config_apply_state"] = "failed"
+		resp["config_error"] = err.Error()
+		log.Printf("xray reload after remove client failed: %v", err)
+		jsonOK(w, resp)
 		return
 	}
+	resp["config_apply_state"] = "revoked"
 
-	jsonOK(w, map[string]bool{"ok": true})
+	jsonOK(w, resp)
 }
 
 // POST /clients/update
@@ -359,4 +436,115 @@ func (s *Server) handleEnsureInbound(w http.ResponseWriter, r *http.Request) {
 
 func roundf(f float64) float64 {
 	return float64(int(f*10)) / 10
+}
+
+// GET /version
+func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
+	jsonOK(w, map[string]string{
+		"agent":   "1.0.0",
+		"xray":    s.process.Version(s.cfg.XrayBin),
+		"server":  s.cfg.ServerName,
+	})
+}
+
+// POST /inbound/short-ids — directly set REALITY shortIds for an inbound.
+type UpdateShortIdsReq struct {
+	InboundTag string   `json:"inbound_tag"`
+	ShortIDs   []string `json:"short_ids"`
+}
+
+func (s *Server) handleUpdateShortIds(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonErr(w, 405, "method not allowed")
+		return
+	}
+	var req UpdateShortIdsReq
+	if err := decodeBody(r, &req); err != nil {
+		jsonErr(w, 400, "invalid body: "+err.Error())
+		return
+	}
+	if err := s.manager.UpdateRealityShortIds(req.InboundTag, req.ShortIDs); err != nil {
+		jsonErr(w, 500, err.Error())
+		return
+	}
+	if err := s.process.Reload(); err != nil {
+		jsonErr(w, http.StatusBadGateway, "shortIds saved, but xray apply failed: "+err.Error())
+		return
+	}
+	jsonOK(w, map[string]bool{"ok": true})
+}
+
+// POST /inbound/rollback — restore the last backup config.
+func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonErr(w, 405, "method not allowed")
+		return
+	}
+	if err := s.manager.Rollback(); err != nil {
+		jsonErr(w, 500, err.Error())
+		return
+	}
+	if err := s.process.Reload(); err != nil {
+		jsonErr(w, http.StatusBadGateway, "rollback applied, but xray reload failed: "+err.Error())
+		return
+	}
+	jsonOK(w, map[string]bool{"ok": true})
+}
+
+// POST /provision — write initial Xray config and start Xray.
+type ProvisionReq struct {
+	Tag         string   `json:"tag"`
+	Port        int      `json:"port"`
+	PrivateKey  string   `json:"private_key"`
+	ShortIDs    []string `json:"short_ids"`
+	ServerNames []string `json:"server_names"`
+	Dest        string   `json:"dest"`
+}
+
+func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonErr(w, 405, "method not allowed")
+		return
+	}
+	var req ProvisionReq
+	if err := decodeBody(r, &req); err != nil {
+		jsonErr(w, 400, "invalid body: "+err.Error())
+		return
+	}
+	if req.PrivateKey == "" || req.Port == 0 {
+		jsonErr(w, 400, "private_key and port are required")
+		return
+	}
+
+	tag := req.Tag
+	if tag == "" {
+		tag = "darkline-reality"
+	}
+	dest := req.Dest
+	if dest == "" {
+		dest = "www.nvidia.com:443"
+	}
+	serverNames := req.ServerNames
+	if len(serverNames) == 0 {
+		serverNames = []string{"www.nvidia.com"}
+	}
+	shortIDs := req.ShortIDs
+
+	cfg := xray.DefaultConfig(req.PrivateKey, shortIDs, serverNames, dest, req.Port)
+	if err := s.manager.WriteConfig(cfg); err != nil {
+		jsonErr(w, 500, "write config: "+err.Error())
+		return
+	}
+
+	if err := s.process.Restart(); err != nil {
+		jsonErr(w, http.StatusBadGateway, "config written, but xray start failed: "+err.Error())
+		return
+	}
+
+	jsonOK(w, map[string]interface{}{
+		"ok":   true,
+		"tag":  tag,
+		"port": req.Port,
+		"xray": s.process.IsRunning(),
+	})
 }

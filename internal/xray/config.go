@@ -86,6 +86,9 @@ type VlessClient struct {
 	TotalGB    int64  `json:"totalGB,omitempty"`
 	ExpiryTime int64  `json:"expiryTime,omitempty"`
 	Enable     bool   `json:"enable"`
+	// ShortId is stored per-client for REALITY shortIds synchronization.
+	// Xray ignores unknown fields, so this is safe to embed in the client JSON.
+	ShortId string `json:"shortId,omitempty"`
 }
 
 // ── RealityStreamSettings ──────────────────────────────────────────────────
@@ -128,6 +131,13 @@ func (m *Manager) Read() (*Config, error) {
 	return m.read()
 }
 
+// WriteConfig replaces the entire managed config and writes it to disk.
+func (m *Manager) WriteConfig(cfg *Config) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.write(cfg)
+}
+
 func (m *Manager) read() (*Config, error) {
 	data, err := os.ReadFile(m.configPath)
 	if err != nil {
@@ -145,7 +155,14 @@ func (m *Manager) write(cfg *Config) error {
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
-	// Write atomically via temp file
+	// Backup existing config before overwriting.
+	if _, statErr := os.Stat(m.configPath); statErr == nil {
+		_ = os.WriteFile(m.configPath+".bak", func() []byte {
+			b, _ := os.ReadFile(m.configPath)
+			return b
+		}(), 0644)
+	}
+	// Write atomically via temp file.
 	tmp := m.configPath + ".tmp"
 	if err := os.WriteFile(tmp, data, 0644); err != nil {
 		return fmt.Errorf("write temp config: %w", err)
@@ -153,7 +170,92 @@ func (m *Manager) write(cfg *Config) error {
 	return os.Rename(tmp, m.configPath)
 }
 
-// AddClient adds a VLESS client to the inbound with given tag.
+// Rollback restores the last backup if present.
+func (m *Manager) Rollback() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	bak := m.configPath + ".bak"
+	if _, err := os.Stat(bak); err != nil {
+		return fmt.Errorf("no backup found")
+	}
+	return os.Rename(bak, m.configPath)
+}
+
+// syncRealityShortIds rebuilds the shortIds list for a Reality inbound from
+// active clients' ShortId fields and writes the config. Must be called with lock held.
+func (m *Manager) syncRealityShortIds(cfg *Config, inboundTag string) error {
+	for i, inb := range cfg.Inbounds {
+		if inb.Protocol != "vless" {
+			continue
+		}
+		if inboundTag != "" && inb.Tag != inboundTag {
+			continue
+		}
+		var stream RealityStreamSettings
+		if err := json.Unmarshal(inb.StreamSettings, &stream); err != nil {
+			continue
+		}
+		if stream.Security != "reality" {
+			continue
+		}
+		var settings VlessInboundSettings
+		if err := json.Unmarshal(inb.Settings, &settings); err != nil {
+			continue
+		}
+		ids := make([]string, 0, len(settings.Clients))
+		seen := map[string]bool{}
+		for _, c := range settings.Clients {
+			if c.ShortId != "" && !seen[c.ShortId] {
+				ids = append(ids, c.ShortId)
+				seen[c.ShortId] = true
+			}
+		}
+		stream.RealitySettings.ShortIds = ids
+		raw, err := json.Marshal(stream)
+		if err != nil {
+			return fmt.Errorf("marshal stream: %w", err)
+		}
+		cfg.Inbounds[i].StreamSettings = raw
+	}
+	return nil
+}
+
+// UpdateRealityShortIds sets the shortIds list directly for a Reality inbound.
+func (m *Manager) UpdateRealityShortIds(inboundTag string, shortIds []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cfg, err := m.read()
+	if err != nil {
+		return err
+	}
+
+	found := false
+	for i, inb := range cfg.Inbounds {
+		if inboundTag != "" && inb.Tag != inboundTag {
+			continue
+		}
+		var stream RealityStreamSettings
+		if err := json.Unmarshal(inb.StreamSettings, &stream); err != nil {
+			continue
+		}
+		if stream.Security != "reality" {
+			continue
+		}
+		stream.RealitySettings.ShortIds = shortIds
+		raw, _ := json.Marshal(stream)
+		cfg.Inbounds[i].StreamSettings = raw
+		found = true
+	}
+
+	if !found {
+		return fmt.Errorf("reality inbound %q not found", inboundTag)
+	}
+	return m.write(cfg)
+}
+
+// AddClient adds a VLESS client to the inbound with given tag and synchronizes
+// REALITY shortIds to include the client's ShortId.
 // If inbound tag is empty, uses the first VLESS inbound found.
 func (m *Manager) AddClient(inboundTag string, client VlessClient) error {
 	m.mu.Lock()
@@ -191,13 +293,20 @@ func (m *Manager) AddClient(inboundTag string, client VlessClient) error {
 			return err
 		}
 		cfg.Inbounds[i].Settings = raw
+
+		// Sync REALITY shortIds from all clients' ShortId fields.
+		if err := m.syncRealityShortIds(cfg, inb.Tag); err != nil {
+			return fmt.Errorf("sync shortIds: %w", err)
+		}
+
 		return m.write(cfg)
 	}
 
 	return fmt.Errorf("inbound %q not found", inboundTag)
 }
 
-// RemoveClient removes a client by UUID from a specific inbound (or all if tag="").
+// RemoveClient removes a client by UUID from a specific inbound (or all if tag="")
+// and synchronizes REALITY shortIds accordingly.
 func (m *Manager) RemoveClient(inboundTag, clientID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -208,6 +317,7 @@ func (m *Manager) RemoveClient(inboundTag, clientID string) error {
 	}
 
 	removed := false
+	affectedTags := []string{}
 	for i, inb := range cfg.Inbounds {
 		if inb.Protocol != "vless" {
 			continue
@@ -222,7 +332,7 @@ func (m *Manager) RemoveClient(inboundTag, clientID string) error {
 		}
 
 		before := len(settings.Clients)
-		filtered := settings.Clients[:0]
+		filtered := make([]VlessClient, 0, before)
 		for _, c := range settings.Clients {
 			if c.ID != clientID {
 				filtered = append(filtered, c)
@@ -232,6 +342,7 @@ func (m *Manager) RemoveClient(inboundTag, clientID string) error {
 
 		if len(settings.Clients) < before {
 			removed = true
+			affectedTags = append(affectedTags, inb.Tag)
 			raw, _ := json.Marshal(settings)
 			cfg.Inbounds[i].Settings = raw
 		}
@@ -240,6 +351,14 @@ func (m *Manager) RemoveClient(inboundTag, clientID string) error {
 	if !removed {
 		return fmt.Errorf("client %s not found", clientID)
 	}
+
+	// Sync REALITY shortIds for all affected inbounds.
+	for _, tag := range affectedTags {
+		if err := m.syncRealityShortIds(cfg, tag); err != nil {
+			return fmt.Errorf("sync shortIds: %w", err)
+		}
+	}
+
 	return m.write(cfg)
 }
 
