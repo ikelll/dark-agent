@@ -551,7 +551,9 @@ func DefaultConfig(privateKey string, shortIDs []string, serverNames []string, d
 	})
 
 	apiSettings, _ := json.Marshal(map[string]interface{}{})
-	directSettings, _ := json.Marshal(map[string]interface{}{})
+	directSettings, _ := json.Marshal(map[string]interface{}{
+		"domainStrategy": "UseIPv4",
+	})
 
 	return &Config{
 		Log: &LogConfig{LogLevel: "warning"},
