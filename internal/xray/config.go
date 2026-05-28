@@ -293,6 +293,18 @@ func (m *Manager) AddClient(inboundTag string, client VlessClient) error {
 			}
 		}
 
+		// If the inbound uses xhttp transport, strip flow from all clients
+		// (including the new one). XTLS Vision flow is only for raw TCP.
+		if inb.StreamSettings != nil {
+			var ss RealityStreamSettings
+			if json.Unmarshal(inb.StreamSettings, &ss) == nil && ss.Network == "xhttp" {
+				client.Flow = ""
+				for j := range settings.Clients {
+					settings.Clients[j].Flow = ""
+				}
+			}
+		}
+
 		settings.Clients = append(settings.Clients, client)
 
 		raw, err := json.Marshal(settings)
