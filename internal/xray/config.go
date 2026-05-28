@@ -98,6 +98,7 @@ type RealityStreamSettings struct {
 	Security        string          `json:"security"`
 	RealitySettings RealitySettings `json:"realitySettings"`
 	TCPSettings     *TCPSettings    `json:"tcpSettings,omitempty"`
+	XhttpSettings   *XhttpSettings  `json:"xhttpSettings,omitempty"`
 }
 
 type RealitySettings struct {
@@ -112,6 +113,12 @@ type TCPSettings struct {
 	Header struct {
 		Type string `json:"type"`
 	} `json:"header"`
+}
+
+type XhttpSettings struct {
+	Host string `json:"host,omitempty"`
+	Path string `json:"path,omitempty"`
+	Mode string `json:"mode,omitempty"`
 }
 
 // ── ConfigManager ──────────────────────────────────────────────────────────
@@ -524,16 +531,27 @@ func (m *Manager) GetRealityKeys(tag string) (privateKey, publicKey string, shor
 
 // ── Bootstrap config ───────────────────────────────────────────────────────
 
-// DefaultConfig returns a minimal working Xray config with Reality TCP inbound.
-func DefaultConfig(privateKey string, shortIDs []string, serverNames []string, dest string, port int) *Config {
+// DefaultConfig returns a minimal working Xray config with Reality inbound.
+// transport should be "xhttp" (default) or "tcp".
+func DefaultConfig(privateKey string, shortIDs []string, serverNames []string, dest string, port int, transport ...string) *Config {
+	tr := "xhttp"
+	if len(transport) > 0 && transport[0] == "tcp" {
+		tr = "tcp"
+	}
+
 	settings := VlessInboundSettings{
 		Clients:    []VlessClient{},
 		Decryption: "none",
 	}
 	settingsRaw, _ := json.Marshal(settings)
 
+	sni := ""
+	if len(serverNames) > 0 {
+		sni = serverNames[0]
+	}
+
 	stream := RealityStreamSettings{
-		Network:  "tcp",
+		Network:  tr,
 		Security: "reality",
 		RealitySettings: RealitySettings{
 			Show:        false,
@@ -543,11 +561,18 @@ func DefaultConfig(privateKey string, shortIDs []string, serverNames []string, d
 			ShortIds:    shortIDs,
 		},
 	}
+	if tr == "xhttp" {
+		stream.XhttpSettings = &XhttpSettings{
+			Host: sni,
+			Path: "/",
+			Mode: "auto",
+		}
+	}
 	streamRaw, _ := json.Marshal(stream)
 
 	sniffing, _ := json.Marshal(map[string]interface{}{
 		"enabled":      true,
-		"destOverride": []string{"http", "tls", "quic"},
+		"destOverride": []string{"http", "tls"},
 	})
 
 	apiSettings, _ := json.Marshal(map[string]interface{}{})

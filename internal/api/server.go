@@ -499,6 +499,8 @@ type ProvisionReq struct {
 	ShortIDs    []string `json:"short_ids"`
 	ServerNames []string `json:"server_names"`
 	Dest        string   `json:"dest"`
+	Transport   string   `json:"transport"` // "xhttp" (default) or "tcp"
+	Force       bool     `json:"force"`     // overwrite even if active clients exist
 }
 
 func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
@@ -516,6 +518,25 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Protect against accidental overwrite of a live config with active clients.
+	if !req.Force {
+		if existing, err := s.manager.Read(); err == nil {
+			for _, inbound := range existing.Inbounds {
+				if inbound.Tag == "api" {
+					continue
+				}
+				var settings xray.VlessInboundSettings
+				if json.Unmarshal(inbound.Settings, &settings) == nil && len(settings.Clients) > 0 {
+					jsonErr(w, 409, fmt.Sprintf(
+						"inbound %q already has %d active client(s); send force=true to overwrite",
+						inbound.Tag, len(settings.Clients),
+					))
+					return
+				}
+			}
+		}
+	}
+
 	tag := req.Tag
 	if tag == "" {
 		tag = "darkline-reality"
@@ -528,9 +549,12 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	if len(serverNames) == 0 {
 		serverNames = []string{"www.nvidia.com"}
 	}
-	shortIDs := req.ShortIDs
+	transport := req.Transport
+	if transport == "" {
+		transport = "xhttp"
+	}
 
-	cfg := xray.DefaultConfig(req.PrivateKey, shortIDs, serverNames, dest, req.Port)
+	cfg := xray.DefaultConfig(req.PrivateKey, req.ShortIDs, serverNames, dest, req.Port, transport)
 	if err := s.manager.WriteConfig(cfg); err != nil {
 		jsonErr(w, 500, "write config: "+err.Error())
 		return
@@ -542,9 +566,10 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonOK(w, map[string]interface{}{
-		"ok":   true,
-		"tag":  tag,
-		"port": req.Port,
-		"xray": s.process.IsRunning(),
+		"ok":        true,
+		"tag":       tag,
+		"port":      req.Port,
+		"transport": transport,
+		"xray":      s.process.IsRunning(),
 	})
 }
