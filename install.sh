@@ -13,6 +13,7 @@ AGENT_CONFIG="$AGENT_DIR/config.json"
 SERVICE_FILE="/etc/systemd/system/darkline-agent.service"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
+XRAY_ASSET_DIR="$(dirname "$XRAY_BIN")"
 XRAY_DIR="/etc/xray"
 LISTEN_ADDR=":7070"
 
@@ -37,7 +38,7 @@ fi
 # ── 1. Install Xray ─────────────────────────────────────────────────────────
 
 echo "[1/5] Installing Xray..."
-if [ ! -f "$XRAY_BIN" ]; then
+if [ ! -f "$XRAY_BIN" ] || [ ! -f "$XRAY_ASSET_DIR/geoip.dat" ] || [ ! -f "$XRAY_ASSET_DIR/geosite.dat" ]; then
   ARCH=$(uname -m)
   if [ "$ARCH" = "x86_64" ]; then XR_ARCH="64"
   elif [ "$ARCH" = "aarch64" ]; then XR_ARCH="arm64-v8a"
@@ -46,13 +47,16 @@ if [ ! -f "$XRAY_BIN" ]; then
   mkdir -p /tmp/xray-install
   cd /tmp/xray-install
   curl -fsSLo xray.zip "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XR_ARCH}.zip"
-  unzip -o xray.zip xray
+  unzip -o xray.zip xray geoip.dat geosite.dat
   install -m 755 xray "$XRAY_BIN"
+  install -m 644 geoip.dat "$XRAY_ASSET_DIR/geoip.dat"
+  install -m 644 geosite.dat "$XRAY_ASSET_DIR/geosite.dat"
   cd /
   rm -rf /tmp/xray-install
   echo "Xray installed: $($XRAY_BIN version | head -1)"
+  echo "Xray geo assets installed: $XRAY_ASSET_DIR/geoip.dat, $XRAY_ASSET_DIR/geosite.dat"
 else
-  echo "Xray already at $XRAY_BIN"
+  echo "Xray already at $XRAY_BIN with geo assets in $XRAY_ASSET_DIR"
 fi
 
 # ── 2. Create Xray config ────────────────────────────────────────────────────

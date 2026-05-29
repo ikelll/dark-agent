@@ -519,7 +519,16 @@ func (s *Server) handleApplyRouting(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.process.Reload(); err != nil {
-		jsonErr(w, http.StatusBadGateway, "routing saved, but xray reload failed: "+err.Error())
+		reloadErr := err
+		if rbErr := s.manager.Rollback(); rbErr != nil {
+			jsonErr(w, http.StatusBadGateway, "routing saved, but xray reload failed and rollback failed: "+reloadErr.Error()+"; rollback: "+rbErr.Error())
+			return
+		}
+		if restoreErr := s.process.Reload(); restoreErr != nil {
+			jsonErr(w, http.StatusBadGateway, "routing rejected, previous config restored, but xray restart failed: "+reloadErr.Error()+"; restore: "+restoreErr.Error())
+			return
+		}
+		jsonErr(w, http.StatusBadGateway, "routing rejected, previous config restored: "+reloadErr.Error())
 		return
 	}
 	jsonOK(w, map[string]interface{}{"ok": true, "rules": len(rules)})
