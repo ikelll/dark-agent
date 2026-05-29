@@ -5,7 +5,8 @@
 
 set -e
 
-AGENT_VERSION="latest"
+AGENT_REPO="ikelll/dark-agent"
+AGENT_VERSION="${AGENT_VERSION:-latest}"
 AGENT_BIN="/usr/local/bin/darkline-agent"
 AGENT_DIR="/etc/darkline-agent"
 AGENT_CONFIG="$AGENT_DIR/config.json"
@@ -122,17 +123,28 @@ if [ "$ARCH" = "x86_64" ];  then AGENT_ARCH="linux-amd64"
 elif [ "$ARCH" = "aarch64" ]; then AGENT_ARCH="linux-arm64"
 else AGENT_ARCH="linux-amd64"; fi
 
-# Try download from GitHub releases, fall back to build instruction
-if command -v curl &>/dev/null; then
-  RELEASE_URL="https://github.com/darkerline/agent/releases/latest/download/darkline-agent-${AGENT_ARCH}"
-  if curl --output /dev/null --silent --head --fail "$RELEASE_URL"; then
-    curl -fsSLo "$AGENT_BIN" "$RELEASE_URL"
-    chmod +x "$AGENT_BIN"
-    echo "Agent downloaded from releases"
-  else
-    echo "No prebuilt binary found. Build manually:"
-    echo "  go build -o darkline-agent ./cmd/agent && cp darkline-agent $AGENT_BIN"
-  fi
+# Download from GitHub releases
+if [ "$AGENT_VERSION" = "latest" ]; then
+  RELEASE_URL="https://github.com/${AGENT_REPO}/releases/latest/download/darkline-agent-${AGENT_ARCH}"
+else
+  RELEASE_URL="https://github.com/${AGENT_REPO}/releases/download/${AGENT_VERSION}/darkline-agent-${AGENT_ARCH}"
+fi
+
+if curl --output /dev/null --silent --head --fail "$RELEASE_URL"; then
+  curl -fsSLo "$AGENT_BIN" "$RELEASE_URL"
+  chmod +x "$AGENT_BIN"
+  echo "Agent downloaded: $RELEASE_URL"
+else
+  echo "ERROR: Could not download agent binary from:"
+  echo "  $RELEASE_URL"
+  echo ""
+  echo "Make sure the release exists at:"
+  echo "  https://github.com/${AGENT_REPO}/releases"
+  echo ""
+  echo "Or build manually:"
+  echo "  git clone https://github.com/${AGENT_REPO} && cd dark-agent"
+  echo "  make build-linux && cp darkline-agent-linux-amd64 $AGENT_BIN"
+  exit 1
 fi
 
 # ── 4. Write agent config ────────────────────────────────────────────────────
