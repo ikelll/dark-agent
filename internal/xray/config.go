@@ -53,6 +53,9 @@ type RoutingConfig struct {
 type RoutingRule struct {
 	Type        string   `json:"type"`
 	InboundTag  []string `json:"inboundTag,omitempty"`
+	Domain      []string `json:"domain,omitempty"`
+	IP          []string `json:"ip,omitempty"`
+	Protocol    []string `json:"protocol,omitempty"`
 	OutboundTag string   `json:"outboundTag"`
 }
 
@@ -258,6 +261,35 @@ func (m *Manager) UpdateRealityShortIds(inboundTag string, shortIds []string) er
 	if !found {
 		return fmt.Errorf("reality inbound %q not found", inboundTag)
 	}
+	return m.write(cfg)
+}
+
+// ApplyRoutingRules replaces managed non-API routing rules and preserves the
+// internal API route required for Xray HandlerService/StatsService.
+func (m *Manager) ApplyRoutingRules(rules []RoutingRule) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cfg, err := m.read()
+	if err != nil {
+		return err
+	}
+
+	apiRule := RoutingRule{Type: "field", InboundTag: []string{"api"}, OutboundTag: "api"}
+	next := []RoutingRule{apiRule}
+	for _, rule := range rules {
+		if rule.Type == "" {
+			rule.Type = "field"
+		}
+		if rule.OutboundTag == "" || rule.OutboundTag == "api" {
+			continue
+		}
+		next = append(next, rule)
+	}
+	if cfg.Routing == nil {
+		cfg.Routing = &RoutingConfig{}
+	}
+	cfg.Routing.Rules = next
 	return m.write(cfg)
 }
 

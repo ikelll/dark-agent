@@ -48,6 +48,7 @@ func (s *Server) Run() error {
 	mux.HandleFunc("/inbound/ensure", s.auth(s.handleEnsureInbound))
 	mux.HandleFunc("/inbound/short-ids", s.auth(s.handleUpdateShortIds))
 	mux.HandleFunc("/inbound/rollback", s.auth(s.handleRollback))
+	mux.HandleFunc("/routing/apply", s.auth(s.handleApplyRouting))
 	mux.HandleFunc("/provision", s.auth(s.handleProvision))
 
 	srv := &http.Server{
@@ -441,9 +442,9 @@ func roundf(f float64) float64 {
 // GET /version
 func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]string{
-		"agent":   "1.0.0",
-		"xray":    s.process.Version(s.cfg.XrayBin),
-		"server":  s.cfg.ServerName,
+		"agent":  "1.0.0",
+		"xray":   s.process.Version(s.cfg.XrayBin),
+		"server": s.cfg.ServerName,
 	})
 }
 
@@ -472,6 +473,56 @@ func (s *Server) handleUpdateShortIds(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOK(w, map[string]bool{"ok": true})
+}
+
+// POST /routing/apply — replace managed Xray routing rules.
+type RoutingRuleReq struct {
+	Type        string   `json:"type"`
+	InboundTag  []string `json:"inboundTag"`
+	Domain      []string `json:"domain"`
+	IP          []string `json:"ip"`
+	Protocol    []string `json:"protocol"`
+	OutboundTag string   `json:"outboundTag"`
+}
+
+type ApplyRoutingReq struct {
+	Rules []RoutingRuleReq `json:"rules"`
+}
+
+func (s *Server) handleApplyRouting(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonErr(w, 405, "method not allowed")
+		return
+	}
+	var req ApplyRoutingReq
+	if err := decodeBody(r, &req); err != nil {
+		jsonErr(w, 400, "invalid body: "+err.Error())
+		return
+	}
+	rules := make([]xray.RoutingRule, 0, len(req.Rules))
+	for _, r := range req.Rules {
+		if r.OutboundTag != "direct" && r.OutboundTag != "blocked" {
+			jsonErr(w, 400, "outboundTag must be direct or blocked")
+			return
+		}
+		rules = append(rules, xray.RoutingRule{
+			Type:        r.Type,
+			InboundTag:  r.InboundTag,
+			Domain:      r.Domain,
+			IP:          r.IP,
+			Protocol:    r.Protocol,
+			OutboundTag: r.OutboundTag,
+		})
+	}
+	if err := s.manager.ApplyRoutingRules(rules); err != nil {
+		jsonErr(w, 500, err.Error())
+		return
+	}
+	if err := s.process.Reload(); err != nil {
+		jsonErr(w, http.StatusBadGateway, "routing saved, but xray reload failed: "+err.Error())
+		return
+	}
+	jsonOK(w, map[string]interface{}{"ok": true, "rules": len(rules)})
 }
 
 // POST /inbound/rollback — restore the last backup config.
