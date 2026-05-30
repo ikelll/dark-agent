@@ -50,6 +50,10 @@ func (s *Server) Run() error {
 	mux.HandleFunc("/inbound/rollback", s.auth(s.handleRollback))
 	mux.HandleFunc("/routing/apply", s.auth(s.handleApplyRouting))
 	mux.HandleFunc("/provision", s.auth(s.handleProvision))
+	mux.HandleFunc("/relay/outbound/setup", s.auth(s.handleRelayOutboundSetup))
+	mux.HandleFunc("/relay/outbound/remove", s.auth(s.handleRelayOutboundRemove))
+	mux.HandleFunc("/relay/inbound/setup", s.auth(s.handleRelayInboundSetup))
+	mux.HandleFunc("/relay/inbound/remove", s.auth(s.handleRelayInboundRemove))
 
 	srv := &http.Server{
 		Addr:         s.cfg.ListenAddr,
@@ -632,4 +636,139 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		"transport": transport,
 		"xray":      s.process.IsRunning(),
 	})
+}
+
+// ── Relay handlers ─────────────────────────────────────────────────────────────
+
+// POST /relay/outbound/setup — add VLESS outbound to worker + routing rule on entry.
+type RelayOutboundSetupReq struct {
+	OutboundTag       string `json:"outbound_tag"`
+	ClientInboundTag  string `json:"client_inbound_tag"`
+	WorkerIP          string `json:"worker_ip"`
+	WorkerPort        int    `json:"worker_port"`
+	RelayUUID         string `json:"relay_uuid"`
+}
+
+func (s *Server) handleRelayOutboundSetup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonErr(w, 405, "method not allowed")
+		return
+	}
+	var req RelayOutboundSetupReq
+	if err := decodeBody(r, &req); err != nil {
+		jsonErr(w, 400, "invalid body: "+err.Error())
+		return
+	}
+	if req.OutboundTag == "" || req.WorkerIP == "" || req.WorkerPort == 0 || req.RelayUUID == "" {
+		jsonErr(w, 400, "outbound_tag, worker_ip, worker_port, relay_uuid are required")
+		return
+	}
+	if req.ClientInboundTag == "" {
+		req.ClientInboundTag = "darkline-reality"
+	}
+	if err := s.manager.AddRelayOutbound(req.OutboundTag, req.ClientInboundTag, req.WorkerIP, req.WorkerPort, req.RelayUUID); err != nil {
+		jsonErr(w, 500, err.Error())
+		return
+	}
+	if err := s.process.Reload(); err != nil {
+		jsonErr(w, http.StatusBadGateway, "relay outbound saved, but xray reload failed: "+err.Error())
+		return
+	}
+	jsonOK(w, map[string]interface{}{"ok": true, "outbound_tag": req.OutboundTag})
+}
+
+// POST /relay/outbound/remove — remove relay outbound from entry.
+type RelayOutboundRemoveReq struct {
+	OutboundTag      string `json:"outbound_tag"`
+	ClientInboundTag string `json:"client_inbound_tag"`
+}
+
+func (s *Server) handleRelayOutboundRemove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonErr(w, 405, "method not allowed")
+		return
+	}
+	var req RelayOutboundRemoveReq
+	if err := decodeBody(r, &req); err != nil {
+		jsonErr(w, 400, "invalid body: "+err.Error())
+		return
+	}
+	if req.OutboundTag == "" {
+		jsonErr(w, 400, "outbound_tag is required")
+		return
+	}
+	if req.ClientInboundTag == "" {
+		req.ClientInboundTag = "darkline-reality"
+	}
+	if err := s.manager.RemoveRelayOutbound(req.OutboundTag, req.ClientInboundTag); err != nil {
+		jsonErr(w, 500, err.Error())
+		return
+	}
+	if err := s.process.Reload(); err != nil {
+		jsonErr(w, http.StatusBadGateway, "relay outbound removed, but xray reload failed: "+err.Error())
+		return
+	}
+	jsonOK(w, map[string]bool{"ok": true})
+}
+
+// POST /relay/inbound/setup — add plain VLESS inbound on worker for relay traffic.
+type RelayInboundSetupReq struct {
+	InboundTag string `json:"inbound_tag"`
+	Port       int    `json:"port"`
+	RelayUUID  string `json:"relay_uuid"`
+}
+
+func (s *Server) handleRelayInboundSetup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonErr(w, 405, "method not allowed")
+		return
+	}
+	var req RelayInboundSetupReq
+	if err := decodeBody(r, &req); err != nil {
+		jsonErr(w, 400, "invalid body: "+err.Error())
+		return
+	}
+	if req.InboundTag == "" || req.Port == 0 || req.RelayUUID == "" {
+		jsonErr(w, 400, "inbound_tag, port, relay_uuid are required")
+		return
+	}
+	if err := s.manager.AddRelayInbound(req.InboundTag, req.Port, req.RelayUUID); err != nil {
+		jsonErr(w, 500, err.Error())
+		return
+	}
+	if err := s.process.Reload(); err != nil {
+		jsonErr(w, http.StatusBadGateway, "relay inbound saved, but xray reload failed: "+err.Error())
+		return
+	}
+	jsonOK(w, map[string]interface{}{"ok": true, "inbound_tag": req.InboundTag, "port": req.Port})
+}
+
+// POST /relay/inbound/remove — remove relay inbound from worker.
+type RelayInboundRemoveReq struct {
+	InboundTag string `json:"inbound_tag"`
+}
+
+func (s *Server) handleRelayInboundRemove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonErr(w, 405, "method not allowed")
+		return
+	}
+	var req RelayInboundRemoveReq
+	if err := decodeBody(r, &req); err != nil {
+		jsonErr(w, 400, "invalid body: "+err.Error())
+		return
+	}
+	if req.InboundTag == "" {
+		jsonErr(w, 400, "inbound_tag is required")
+		return
+	}
+	if err := s.manager.RemoveRelayInbound(req.InboundTag); err != nil {
+		jsonErr(w, 500, err.Error())
+		return
+	}
+	if err := s.process.Reload(); err != nil {
+		jsonErr(w, http.StatusBadGateway, "relay inbound removed, but xray reload failed: "+err.Error())
+		return
+	}
+	jsonOK(w, map[string]bool{"ok": true})
 }
