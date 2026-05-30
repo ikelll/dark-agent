@@ -47,7 +47,8 @@ type SystemPolicy struct {
 }
 
 type RoutingConfig struct {
-	Rules []RoutingRule `json:"rules,omitempty"`
+	DomainStrategy string        `json:"domainStrategy,omitempty"`
+	Rules          []RoutingRule `json:"rules,omitempty"`
 }
 
 type RoutingRule struct {
@@ -282,8 +283,18 @@ func (m *Manager) UpdateRealityShortIds(inboundTag string, shortIds []string) er
 	return m.write(cfg)
 }
 
-// ApplyRoutingRules replaces managed non-API routing rules and preserves the
-// internal API route required for Xray HandlerService/StatsService.
+// isSystemOutbound returns true for outbound tags managed by the system
+// (api, direct, blocked) vs relay/custom outbounds managed by relay setup.
+func isSystemOutbound(tag string) bool {
+	return tag == "api" || tag == "direct" || tag == "blocked" || tag == ""
+}
+
+// ApplyRoutingRules replaces user-managed routing rules while preserving:
+//   - The internal API route (api → api)
+//   - Any relay outbound rules (relay-out-* etc.) added by relay setup
+//
+// User rules (direct/blocked) are inserted BEFORE relay catchall rules so
+// that specific domain/IP rules take priority over the relay catchall.
 func (m *Manager) ApplyRoutingRules(rules []RoutingRule) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -293,8 +304,27 @@ func (m *Manager) ApplyRoutingRules(rules []RoutingRule) error {
 		return err
 	}
 
-	apiRule := RoutingRule{Type: "field", InboundTag: []string{"api"}, OutboundTag: "api"}
-	next := []RoutingRule{apiRule}
+	if cfg.Routing == nil {
+		cfg.Routing = &RoutingConfig{}
+	}
+	if cfg.Routing.DomainStrategy == "" {
+		cfg.Routing.DomainStrategy = "IPIfNonMatch"
+	}
+
+	// Collect relay/custom rules already in the config (non-system outbounds).
+	var relayRules []RoutingRule
+	for _, existing := range cfg.Routing.Rules {
+		if !isSystemOutbound(existing.OutboundTag) {
+			relayRules = append(relayRules, existing)
+		}
+	}
+
+	// Build new rule list:
+	// 1. api → api  (always first)
+	// 2. user rules (direct/blocked) — specific domain/IP rules with high priority
+	// 3. relay rules — catchall forwarding rules (must come after specific rules)
+	next := []RoutingRule{{Type: "field", InboundTag: []string{"api"}, OutboundTag: "api"}}
+
 	for _, rule := range rules {
 		if rule.Type == "" {
 			rule.Type = "field"
@@ -302,11 +332,14 @@ func (m *Manager) ApplyRoutingRules(rules []RoutingRule) error {
 		if rule.OutboundTag == "" || rule.OutboundTag == "api" {
 			continue
 		}
+		if !isSystemOutbound(rule.OutboundTag) {
+			continue // skip relay tags from user input — managed by relay setup
+		}
 		next = append(next, rule)
 	}
-	if cfg.Routing == nil {
-		cfg.Routing = &RoutingConfig{}
-	}
+
+	next = append(next, relayRules...)
+
 	cfg.Routing.Rules = next
 	return m.write(cfg)
 }
@@ -679,6 +712,7 @@ func DefaultConfig(privateKey string, shortIDs []string, serverNames []string, d
 			{Tag: "blocked", Protocol: "blackhole", Settings: directSettings},
 		},
 		Routing: &RoutingConfig{
+			DomainStrategy: "IPIfNonMatch",
 			Rules: []RoutingRule{
 				{Type: "field", InboundTag: []string{"api"}, OutboundTag: "api"},
 			},
@@ -733,9 +767,14 @@ func (m *Manager) AddRelayOutbound(outboundTag, clientInboundTag, workerIP strin
 	if cfg.Routing == nil {
 		cfg.Routing = &RoutingConfig{}
 	}
+	if cfg.Routing.DomainStrategy == "" {
+		cfg.Routing.DomainStrategy = "IPIfNonMatch"
+	}
 	newRules := []RoutingRule{}
 	for _, rule := range cfg.Routing.Rules {
-		// Remove any existing rule that routes clientInboundTag elsewhere.
+		// Remove only the previously managed relay rule for this inbound.
+		// User direct/blocked rules for the same inbound must stay before the
+		// catchall relay rule so RU/private/etc. can exit from the entry server.
 		isForThisInbound := false
 		for _, tag := range rule.InboundTag {
 			if tag == clientInboundTag {
@@ -743,7 +782,7 @@ func (m *Manager) AddRelayOutbound(outboundTag, clientInboundTag, workerIP strin
 				break
 			}
 		}
-		if !isForThisInbound {
+		if !(isForThisInbound && !isSystemOutbound(rule.OutboundTag)) {
 			newRules = append(newRules, rule)
 		}
 	}
@@ -836,6 +875,9 @@ func (m *Manager) AddRelayInbound(tag string, port int, relayUUID string) error 
 	// Add routing rule: relay inbound → direct.
 	if cfg.Routing == nil {
 		cfg.Routing = &RoutingConfig{}
+	}
+	if cfg.Routing.DomainStrategy == "" {
+		cfg.Routing.DomainStrategy = "IPIfNonMatch"
 	}
 	newRules := []RoutingRule{}
 	for _, rule := range cfg.Routing.Rules {
