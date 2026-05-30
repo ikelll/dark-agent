@@ -48,7 +48,13 @@ type SystemPolicy struct {
 
 type RoutingConfig struct {
 	DomainStrategy string        `json:"domainStrategy,omitempty"`
+	Balancers      []Balancer    `json:"balancers,omitempty"`
 	Rules          []RoutingRule `json:"rules,omitempty"`
+}
+
+type Balancer struct {
+	Tag      string   `json:"tag"`
+	Selector []string `json:"selector"`
 }
 
 type RoutingRule struct {
@@ -57,7 +63,8 @@ type RoutingRule struct {
 	Domain      []string `json:"domain,omitempty"`
 	IP          []string `json:"ip,omitempty"`
 	Protocol    []string `json:"protocol,omitempty"`
-	OutboundTag string   `json:"outboundTag"`
+	OutboundTag string   `json:"outboundTag,omitempty"`
+	BalancerTag string   `json:"balancerTag,omitempty"`
 }
 
 type Inbound struct {
@@ -311,10 +318,10 @@ func (m *Manager) ApplyRoutingRules(rules []RoutingRule) error {
 		cfg.Routing.DomainStrategy = "IPIfNonMatch"
 	}
 
-	// Collect relay/custom rules already in the config (non-system outbounds).
+	// Collect relay/custom rules already in the config (non-system outbounds or balancers).
 	var relayRules []RoutingRule
 	for _, existing := range cfg.Routing.Rules {
-		if !isSystemOutbound(existing.OutboundTag) {
+		if existing.BalancerTag != "" || !isSystemOutbound(existing.OutboundTag) {
 			relayRules = append(relayRules, existing)
 		}
 	}
@@ -782,7 +789,7 @@ func (m *Manager) AddRelayOutbound(outboundTag, clientInboundTag, workerIP strin
 				break
 			}
 		}
-		if !(isForThisInbound && !isSystemOutbound(rule.OutboundTag)) {
+		if !(isForThisInbound && (rule.BalancerTag != "" || !isSystemOutbound(rule.OutboundTag))) {
 			newRules = append(newRules, rule)
 		}
 	}
@@ -790,6 +797,68 @@ func (m *Manager) AddRelayOutbound(outboundTag, clientInboundTag, workerIP strin
 		Type:        "field",
 		InboundTag:  []string{clientInboundTag},
 		OutboundTag: outboundTag,
+	})
+	cfg.Routing.Rules = newRules
+
+	return m.write(cfg)
+}
+
+// SetRelayBalancer routes clientInboundTag through an Xray balancer over the
+// supplied relay outbound tags. Outbounds must already exist in the config.
+func (m *Manager) SetRelayBalancer(balancerTag, clientInboundTag string, outboundTags []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cfg, err := m.read()
+	if err != nil {
+		return err
+	}
+	if cfg.Routing == nil {
+		cfg.Routing = &RoutingConfig{}
+	}
+	if cfg.Routing.DomainStrategy == "" {
+		cfg.Routing.DomainStrategy = "IPIfNonMatch"
+	}
+
+	selectors := make([]string, 0, len(outboundTags))
+	seen := map[string]bool{}
+	for _, tag := range outboundTags {
+		if tag == "" || seen[tag] {
+			continue
+		}
+		seen[tag] = true
+		selectors = append(selectors, tag)
+	}
+	if len(selectors) == 0 {
+		return fmt.Errorf("balancer requires at least one outbound tag")
+	}
+
+	balancers := make([]Balancer, 0, len(cfg.Routing.Balancers)+1)
+	for _, balancer := range cfg.Routing.Balancers {
+		if balancer.Tag != balancerTag {
+			balancers = append(balancers, balancer)
+		}
+	}
+	balancers = append(balancers, Balancer{Tag: balancerTag, Selector: selectors})
+	cfg.Routing.Balancers = balancers
+
+	newRules := []RoutingRule{}
+	for _, rule := range cfg.Routing.Rules {
+		isForThisInbound := false
+		for _, tag := range rule.InboundTag {
+			if tag == clientInboundTag {
+				isForThisInbound = true
+				break
+			}
+		}
+		if !(isForThisInbound && (rule.BalancerTag != "" || !isSystemOutbound(rule.OutboundTag))) {
+			newRules = append(newRules, rule)
+		}
+	}
+	newRules = append(newRules, RoutingRule{
+		Type:        "field",
+		InboundTag:  []string{clientInboundTag},
+		BalancerTag: balancerTag,
 	})
 	cfg.Routing.Rules = newRules
 
@@ -827,7 +896,7 @@ func (m *Manager) RemoveRelayOutbound(outboundTag, clientInboundTag string) erro
 					break
 				}
 			}
-			if !isForThisInbound {
+			if !(isForThisInbound && (rule.BalancerTag != "" || !isSystemOutbound(rule.OutboundTag))) {
 				newRules = append(newRules, rule)
 			}
 		}

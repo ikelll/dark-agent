@@ -52,6 +52,7 @@ func (s *Server) Run() error {
 	mux.HandleFunc("/provision", s.auth(s.handleProvision))
 	mux.HandleFunc("/relay/outbound/setup", s.auth(s.handleRelayOutboundSetup))
 	mux.HandleFunc("/relay/outbound/remove", s.auth(s.handleRelayOutboundRemove))
+	mux.HandleFunc("/relay/balancer/setup", s.auth(s.handleRelayBalancerSetup))
 	mux.HandleFunc("/relay/inbound/setup", s.auth(s.handleRelayInboundSetup))
 	mux.HandleFunc("/relay/inbound/remove", s.auth(s.handleRelayInboundRemove))
 
@@ -642,11 +643,11 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 // POST /relay/outbound/setup — add VLESS outbound to worker + routing rule on entry.
 type RelayOutboundSetupReq struct {
-	OutboundTag       string `json:"outbound_tag"`
-	ClientInboundTag  string `json:"client_inbound_tag"`
-	WorkerIP          string `json:"worker_ip"`
-	WorkerPort        int    `json:"worker_port"`
-	RelayUUID         string `json:"relay_uuid"`
+	OutboundTag      string `json:"outbound_tag"`
+	ClientInboundTag string `json:"client_inbound_tag"`
+	WorkerIP         string `json:"worker_ip"`
+	WorkerPort       int    `json:"worker_port"`
+	RelayUUID        string `json:"relay_uuid"`
 }
 
 func (s *Server) handleRelayOutboundSetup(w http.ResponseWriter, r *http.Request) {
@@ -709,6 +710,44 @@ func (s *Server) handleRelayOutboundRemove(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	jsonOK(w, map[string]bool{"ok": true})
+}
+
+// POST /relay/balancer/setup — route client inbound through a balancer over relay outbounds.
+type RelayBalancerSetupReq struct {
+	BalancerTag      string   `json:"balancer_tag"`
+	ClientInboundTag string   `json:"client_inbound_tag"`
+	OutboundTags     []string `json:"outbound_tags"`
+}
+
+func (s *Server) handleRelayBalancerSetup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonErr(w, 405, "method not allowed")
+		return
+	}
+	var req RelayBalancerSetupReq
+	if err := decodeBody(r, &req); err != nil {
+		jsonErr(w, 400, "invalid body: "+err.Error())
+		return
+	}
+	if req.BalancerTag == "" {
+		req.BalancerTag = "relay-workers"
+	}
+	if req.ClientInboundTag == "" {
+		req.ClientInboundTag = "darkline-reality"
+	}
+	if len(req.OutboundTags) == 0 {
+		jsonErr(w, 400, "outbound_tags are required")
+		return
+	}
+	if err := s.manager.SetRelayBalancer(req.BalancerTag, req.ClientInboundTag, req.OutboundTags); err != nil {
+		jsonErr(w, 500, err.Error())
+		return
+	}
+	if err := s.process.Reload(); err != nil {
+		jsonErr(w, http.StatusBadGateway, "relay balancer saved, but xray reload failed: "+err.Error())
+		return
+	}
+	jsonOK(w, map[string]interface{}{"ok": true, "balancer_tag": req.BalancerTag, "outbound_tags": req.OutboundTags})
 }
 
 // POST /relay/inbound/setup — add plain VLESS inbound on worker for relay traffic.
