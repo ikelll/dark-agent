@@ -70,9 +70,27 @@ type Inbound struct {
 }
 
 type Outbound struct {
-	Tag      string          `json:"tag"`
-	Protocol string          `json:"protocol"`
-	Settings json.RawMessage `json:"settings,omitempty"`
+	Tag            string          `json:"tag"`
+	Protocol       string          `json:"protocol"`
+	Settings       json.RawMessage `json:"settings,omitempty"`
+	StreamSettings json.RawMessage `json:"streamSettings,omitempty"`
+}
+
+// ── VLESS outbound structures (for relay) ─────────────────────────────────────
+
+type VlessOutboundSettings struct {
+	Vnext []VlessOutboundVnext `json:"vnext"`
+}
+
+type VlessOutboundVnext struct {
+	Address string              `json:"address"`
+	Port    int                 `json:"port"`
+	Users   []VlessOutboundUser `json:"users"`
+}
+
+type VlessOutboundUser struct {
+	ID         string `json:"id"`
+	Encryption string `json:"encryption"`
 }
 
 // ── VLESS inbound settings ─────────────────────────────────────────────────
@@ -666,4 +684,216 @@ func DefaultConfig(privateKey string, shortIDs []string, serverNames []string, d
 			},
 		},
 	}
+}
+
+// ── Relay helpers ──────────────────────────────────────────────────────────────
+
+// AddRelayOutbound adds a VLESS outbound to a worker server and routes traffic
+// from clientInboundTag through it. Call reload after this.
+func (m *Manager) AddRelayOutbound(outboundTag, clientInboundTag, workerIP string, workerPort int, relayUUID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cfg, err := m.read()
+	if err != nil {
+		return err
+	}
+
+	// Build VLESS outbound settings pointing to worker.
+	obSettings := VlessOutboundSettings{
+		Vnext: []VlessOutboundVnext{{
+			Address: workerIP,
+			Port:    workerPort,
+			Users:   []VlessOutboundUser{{ID: relayUUID, Encryption: "none"}},
+		}},
+	}
+	obSettingsRaw, _ := json.Marshal(obSettings)
+	streamRaw, _ := json.Marshal(map[string]interface{}{"network": "tcp", "security": "none"})
+
+	// Replace or append relay outbound.
+	replaced := false
+	for i, ob := range cfg.Outbounds {
+		if ob.Tag == outboundTag {
+			cfg.Outbounds[i].Settings = obSettingsRaw
+			cfg.Outbounds[i].StreamSettings = streamRaw
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		cfg.Outbounds = append(cfg.Outbounds, Outbound{
+			Tag:            outboundTag,
+			Protocol:       "vless",
+			Settings:       obSettingsRaw,
+			StreamSettings: streamRaw,
+		})
+	}
+
+	// Update routing: route clientInboundTag through this outbound.
+	if cfg.Routing == nil {
+		cfg.Routing = &RoutingConfig{}
+	}
+	newRules := []RoutingRule{}
+	for _, rule := range cfg.Routing.Rules {
+		// Remove any existing rule that routes clientInboundTag elsewhere.
+		isForThisInbound := false
+		for _, tag := range rule.InboundTag {
+			if tag == clientInboundTag {
+				isForThisInbound = true
+				break
+			}
+		}
+		if !isForThisInbound {
+			newRules = append(newRules, rule)
+		}
+	}
+	newRules = append(newRules, RoutingRule{
+		Type:        "field",
+		InboundTag:  []string{clientInboundTag},
+		OutboundTag: outboundTag,
+	})
+	cfg.Routing.Rules = newRules
+
+	return m.write(cfg)
+}
+
+// RemoveRelayOutbound removes the relay outbound and restores direct routing
+// for clientInboundTag. Call reload after this.
+func (m *Manager) RemoveRelayOutbound(outboundTag, clientInboundTag string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cfg, err := m.read()
+	if err != nil {
+		return err
+	}
+
+	// Remove the relay outbound.
+	filtered := make([]Outbound, 0, len(cfg.Outbounds))
+	for _, ob := range cfg.Outbounds {
+		if ob.Tag != outboundTag {
+			filtered = append(filtered, ob)
+		}
+	}
+	cfg.Outbounds = filtered
+
+	// Remove routing rule for clientInboundTag (falls back to default direct).
+	if cfg.Routing != nil {
+		newRules := []RoutingRule{}
+		for _, rule := range cfg.Routing.Rules {
+			isForThisInbound := false
+			for _, tag := range rule.InboundTag {
+				if tag == clientInboundTag {
+					isForThisInbound = true
+					break
+				}
+			}
+			if !isForThisInbound {
+				newRules = append(newRules, rule)
+			}
+		}
+		cfg.Routing.Rules = newRules
+	}
+
+	return m.write(cfg)
+}
+
+// AddRelayInbound adds a plain VLESS inbound on port that accepts relay traffic
+// from the entry server. Call reload after this.
+func (m *Manager) AddRelayInbound(tag string, port int, relayUUID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cfg, err := m.read()
+	if err != nil {
+		return err
+	}
+
+	// Remove existing inbound with same tag.
+	filtered := make([]Inbound, 0, len(cfg.Inbounds))
+	for _, inb := range cfg.Inbounds {
+		if inb.Tag != tag {
+			filtered = append(filtered, inb)
+		}
+	}
+
+	settings := VlessInboundSettings{
+		Clients:    []VlessClient{{ID: relayUUID, Email: "relay-" + tag, Enable: true}},
+		Decryption: "none",
+	}
+	settingsRaw, _ := json.Marshal(settings)
+	streamRaw, _ := json.Marshal(map[string]interface{}{"network": "tcp", "security": "none"})
+
+	filtered = append(filtered, Inbound{
+		Tag:            tag,
+		Port:           port,
+		Protocol:       "vless",
+		Settings:       settingsRaw,
+		StreamSettings: streamRaw,
+	})
+	cfg.Inbounds = filtered
+
+	// Add routing rule: relay inbound → direct.
+	if cfg.Routing == nil {
+		cfg.Routing = &RoutingConfig{}
+	}
+	newRules := []RoutingRule{}
+	for _, rule := range cfg.Routing.Rules {
+		hasTag := false
+		for _, t := range rule.InboundTag {
+			if t == tag {
+				hasTag = true
+				break
+			}
+		}
+		if !hasTag {
+			newRules = append(newRules, rule)
+		}
+	}
+	newRules = append(newRules, RoutingRule{
+		Type:        "field",
+		InboundTag:  []string{tag},
+		OutboundTag: "direct",
+	})
+	cfg.Routing.Rules = newRules
+
+	return m.write(cfg)
+}
+
+// RemoveRelayInbound removes the relay inbound and its routing rule.
+func (m *Manager) RemoveRelayInbound(tag string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cfg, err := m.read()
+	if err != nil {
+		return err
+	}
+
+	filtered := make([]Inbound, 0, len(cfg.Inbounds))
+	for _, inb := range cfg.Inbounds {
+		if inb.Tag != tag {
+			filtered = append(filtered, inb)
+		}
+	}
+	cfg.Inbounds = filtered
+
+	if cfg.Routing != nil {
+		newRules := []RoutingRule{}
+		for _, rule := range cfg.Routing.Rules {
+			hasTag := false
+			for _, t := range rule.InboundTag {
+				if t == tag {
+					hasTag = true
+					break
+				}
+			}
+			if !hasTag {
+				newRules = append(newRules, rule)
+			}
+		}
+		cfg.Routing.Rules = newRules
+	}
+
+	return m.write(cfg)
 }
