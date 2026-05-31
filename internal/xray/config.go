@@ -556,8 +556,9 @@ func (m *Manager) GetInbounds() ([]map[string]interface{}, error) {
 	return result, nil
 }
 
-// EnsureRealityInbound creates a Reality TCP inbound if it doesn't exist.
-func (m *Manager) EnsureRealityInbound(tag string, port int, privateKey string, shortIDs []string, serverNames []string, dest string) error {
+// EnsureRealityInbound creates a Reality inbound if it doesn't exist.
+// transport should be "tcp" or "xhttp"; any other value falls back to tcp.
+func (m *Manager) EnsureRealityInbound(tag string, port int, privateKey string, shortIDs []string, serverNames []string, dest string, transport ...string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -579,8 +580,16 @@ func (m *Manager) EnsureRealityInbound(tag string, port int, privateKey string, 
 	}
 	settingsRaw, _ := json.Marshal(settings)
 
+	tr := "tcp"
+	if len(transport) > 0 && transport[0] == "xhttp" {
+		tr = "xhttp"
+	}
+	sni := ""
+	if len(serverNames) > 0 {
+		sni = serverNames[0]
+	}
 	stream := RealityStreamSettings{
-		Network:  "tcp",
+		Network:  tr,
 		Security: "reality",
 		RealitySettings: RealitySettings{
 			Show:        false,
@@ -590,11 +599,18 @@ func (m *Manager) EnsureRealityInbound(tag string, port int, privateKey string, 
 			ShortIds:    shortIDs,
 		},
 	}
+	if tr == "xhttp" {
+		stream.XhttpSettings = &XhttpSettings{
+			Host: sni,
+			Path: "/",
+			Mode: "auto",
+		}
+	}
 	streamRaw, _ := json.Marshal(stream)
 
 	sniffing, _ := json.Marshal(map[string]interface{}{
 		"enabled":      true,
-		"destOverride": []string{"http", "tls", "quic"},
+		"destOverride": []string{"http", "tls"},
 	})
 
 	inbound := Inbound{

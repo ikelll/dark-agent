@@ -409,6 +409,7 @@ type EnsureInboundReq struct {
 	ShortIDs    []string `json:"short_ids"`
 	ServerNames []string `json:"server_names"`
 	Dest        string   `json:"dest"`
+	Transport   string   `json:"transport"` // "tcp" (default) or "xhttp"
 }
 
 func (s *Server) handleEnsureInbound(w http.ResponseWriter, r *http.Request) {
@@ -426,7 +427,12 @@ func (s *Server) handleEnsureInbound(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.manager.EnsureRealityInbound(req.Tag, req.Port, req.PrivateKey, req.ShortIDs, req.ServerNames, req.Dest); err != nil {
+	transport := req.Transport
+	if transport == "" {
+		transport = "tcp"
+	}
+
+	if err := s.manager.EnsureRealityInbound(req.Tag, req.Port, req.PrivateKey, req.ShortIDs, req.ServerNames, req.Dest, transport); err != nil {
 		jsonErr(w, 500, err.Error())
 		return
 	}
