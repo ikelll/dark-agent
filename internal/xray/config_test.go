@@ -1,6 +1,8 @@
 package xray
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -140,6 +142,33 @@ func TestRemoveClient_removesShortId(t *testing.T) {
 	}
 }
 
+func TestRemoveLastClientKeepsValidRealityConfig(t *testing.T) {
+	const removedID = "aabbccdd11223344"
+	path := makeTestConfig(t, []VlessClient{{ID: "last-client", Email: "last@test", Enable: true, ShortId: removedID}})
+	m := NewManager(path)
+	if err := m.RemoveClient("test-reality", "last-client"); err != nil {
+		t.Fatal(err)
+	}
+	ids := readShortIds(t, path, "test-reality")
+	if len(ids) != 1 || ids[0] == removedID || len(ids[0]) != 16 {
+		t.Fatalf("expected an unassigned placeholder, got %v", ids)
+	}
+	if _, err := hex.DecodeString(ids[0]); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := m.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings VlessInboundSettings
+	if err := json.Unmarshal(cfg.Inbounds[0].Settings, &settings); err != nil {
+		t.Fatal(err)
+	}
+	if len(settings.Clients) != 0 {
+		t.Fatal("removed client remained configured")
+	}
+}
+
 func TestRollback(t *testing.T) {
 	path := makeTestConfig(t, nil)
 	m := NewManager(path)
@@ -192,4 +221,98 @@ func TestSyncRealityShortIds_deduplicates(t *testing.T) {
 	if !slices.Contains(ids, "uniqueid12345678") {
 		t.Errorf("unique shortId missing: %v", ids)
 	}
+}
+
+func TestRelayRequiresEncryptionAndPreservesRoutingPriority(t *testing.T) {
+	path := makeTestConfig(t, nil)
+	m := NewManager(path)
+	key := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	security := RelayRealityConfig{PrivateKey: key, PublicKey: key, ServerName: "www.nvidia.com", ShortID: "0123456789abcdef", Dest: "www.nvidia.com:443"}
+	original, _ := os.ReadFile(path)
+	if err := m.AddRelayOutbound("relay-out-test", "test-reality", "192.0.2.1", 10001, "test-uuid", RelayRealityConfig{}); err == nil {
+		t.Fatal("accepted unencrypted relay")
+	}
+	unchanged, _ := os.ReadFile(path)
+	if string(original) != string(unchanged) {
+		t.Fatal("rejected relay changed config")
+	}
+	if err := m.AddRelayInbound("relay-in-test", 10001, "test-uuid", security); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.AddRelayOutbound("relay-out-test", "test-reality", "192.0.2.1", 10001, "test-uuid", security); err != nil {
+		t.Fatal(err)
+	}
+	direct := RoutingRule{Type: "field", IP: []string{"geoip:ru"}, OutboundTag: "direct"}
+	if err := m.ApplyRoutingRules([]RoutingRule{direct}); err != nil {
+		t.Fatal(err)
+	}
+	// Reapplying topology must not move its catchall ahead of Russian exceptions.
+	if err := m.AddRelayOutbound("relay-out-test", "test-reality", "192.0.2.1", 10001, "test-uuid", security); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := m.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Routing.Rules[len(cfg.Routing.Rules)-1].OutboundTag != "relay-out-test" {
+		t.Fatal("relay catchall lost")
+	}
+	if cfg.Routing.DomainStrategy != "IPOnDemand" {
+		t.Fatal("IP exceptions can be bypassed by the relay catchall")
+	}
+	if cfg.Routing.Rules[1].OutboundTag != "direct" {
+		t.Fatal("specific direct rule moved behind relay")
+	}
+	var outbound map[string]interface{}
+	if err := json.Unmarshal(cfg.Outbounds[0].StreamSettings, &outbound); err != nil {
+		t.Fatal(err)
+	}
+	if outbound["security"] != "reality" {
+		t.Fatal("relay outbound is not encrypted")
+	}
+	params := outbound["realitySettings"].(map[string]interface{})
+	if _, exposed := params["privateKey"]; exposed {
+		t.Fatal("private key leaked to entry")
+	}
+	var inbound RealityStreamSettings
+	for _, inb := range cfg.Inbounds {
+		if inb.Tag == "relay-in-test" {
+			if err := json.Unmarshal(inb.StreamSettings, &inbound); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if inbound.Security != "reality" || !slices.Contains(inbound.RealitySettings.ShortIds, security.ShortID) {
+		t.Fatal("relay inbound security mismatch")
+	}
+	for _, name := range []string{path, path + ".bak"} {
+		info, err := os.Stat(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0600 {
+			t.Fatalf("secret config %s permissions are %v", name, info.Mode().Perm())
+		}
+	}
+}
+
+func TestEnsureInboundCanBindBehindSNIProxy(t *testing.T) {
+	path := makeTestConfig(t, nil)
+	manager := NewManager(path)
+	if err := manager.EnsureRealityInbound("proxied", 1443, "test-key", []string{"aabbccdd"}, []string{"example.com"}, "example.com:443", "xhttp", "127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := manager.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, inb := range cfg.Inbounds {
+		if inb.Tag == "proxied" {
+			if inb.Port != 1443 || inb.Listen != "127.0.0.1" {
+				t.Fatal("incorrect local binding")
+			}
+			return
+		}
+	}
+	t.Fatal("proxied inbound not found")
 }

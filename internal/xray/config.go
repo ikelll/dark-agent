@@ -1,6 +1,9 @@
 package xray
 
 import (
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -193,15 +196,24 @@ func (m *Manager) write(cfg *Config) error {
 	}
 	// Backup existing config before overwriting.
 	if _, statErr := os.Stat(m.configPath); statErr == nil {
-		_ = os.WriteFile(m.configPath+".bak", func() []byte {
-			b, _ := os.ReadFile(m.configPath)
-			return b
-		}(), 0644)
+		previous, err := os.ReadFile(m.configPath)
+		if err != nil {
+			return fmt.Errorf("read previous config: %w", err)
+		}
+		if err := os.WriteFile(m.configPath+".bak", previous, 0600); err != nil {
+			return fmt.Errorf("backup config: %w", err)
+		}
+		if err := os.Chmod(m.configPath+".bak", 0600); err != nil {
+			return err
+		}
 	}
 	// Write atomically via temp file.
 	tmp := m.configPath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
 		return fmt.Errorf("write temp config: %w", err)
+	}
+	if err := os.Chmod(tmp, 0600); err != nil {
+		return err
 	}
 	return os.Rename(tmp, m.configPath)
 }
@@ -245,6 +257,15 @@ func (m *Manager) syncRealityShortIds(cfg *Config, inboundTag string) error {
 				ids = append(ids, c.ShortId)
 				seen[c.ShortId] = true
 			}
+		}
+		// REALITY rejects an empty list even when there are no clients. Use a
+		// fresh, unassigned ID so the removed client's ID is still revoked.
+		if len(ids) == 0 {
+			var placeholder [8]byte
+			if _, err := rand.Read(placeholder[:]); err != nil {
+				return fmt.Errorf("generate idle short ID: %w", err)
+			}
+			ids = append(ids, hex.EncodeToString(placeholder[:]))
 		}
 		stream.RealitySettings.ShortIds = ids
 		raw, err := json.Marshal(stream)
@@ -316,6 +337,13 @@ func (m *Manager) ApplyRoutingRules(rules []RoutingRule) error {
 	}
 	if cfg.Routing.DomainStrategy == "" {
 		cfg.Routing.DomainStrategy = "IPIfNonMatch"
+	}
+	// IP exceptions must resolve domains before a later relay catchall matches.
+	for _, rule := range rules {
+		if len(rule.IP) > 0 {
+			cfg.Routing.DomainStrategy = "IPOnDemand"
+			break
+		}
 	}
 
 	// Collect relay/custom rules already in the config (non-system outbounds or balancers).
@@ -621,6 +649,9 @@ func (m *Manager) EnsureRealityInbound(tag string, port int, privateKey string, 
 		StreamSettings: streamRaw,
 		Sniffing:       sniffing,
 	}
+	if len(transport) > 1 {
+		inbound.Listen = transport[1]
+	}
 
 	cfg.Inbounds = append(cfg.Inbounds, inbound)
 	return m.write(cfg)
@@ -745,9 +776,42 @@ func DefaultConfig(privateKey string, shortIDs []string, serverNames []string, d
 
 // ── Relay helpers ──────────────────────────────────────────────────────────────
 
+// RelayRealityConfig keeps inter-server VPN transport encrypted with REALITY.
+type RelayRealityConfig struct {
+	PrivateKey string `json:"private_key,omitempty"`
+	PublicKey  string `json:"public_key,omitempty"`
+	ServerName string `json:"server_name"`
+	ShortID    string `json:"short_id"`
+	Dest       string `json:"dest,omitempty"`
+}
+
+func (r RelayRealityConfig) validate(outbound bool) error {
+	if r.ServerName == "" || r.ShortID == "" {
+		return fmt.Errorf("REALITY server_name and short_id are required")
+	}
+	id, err := hex.DecodeString(r.ShortID)
+	if err != nil || len(id) == 0 || len(id) > 8 {
+		return fmt.Errorf("REALITY short_id must encode 1 to 8 bytes")
+	}
+	key := r.PrivateKey
+	if outbound {
+		key = r.PublicKey
+	} else if r.Dest == "" {
+		return fmt.Errorf("REALITY destination is required")
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(key)
+	if err != nil || len(decoded) != 32 {
+		return fmt.Errorf("a valid REALITY key is required")
+	}
+	return nil
+}
+
 // AddRelayOutbound adds a VLESS outbound to a worker server and routes traffic
 // from clientInboundTag through it. Call reload after this.
-func (m *Manager) AddRelayOutbound(outboundTag, clientInboundTag, workerIP string, workerPort int, relayUUID string) error {
+func (m *Manager) AddRelayOutbound(outboundTag, clientInboundTag, workerIP string, workerPort int, relayUUID string, reality RelayRealityConfig) error {
+	if err := reality.validate(true); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -765,7 +829,10 @@ func (m *Manager) AddRelayOutbound(outboundTag, clientInboundTag, workerIP strin
 		}},
 	}
 	obSettingsRaw, _ := json.Marshal(obSettings)
-	streamRaw, _ := json.Marshal(map[string]interface{}{"network": "tcp", "security": "none"})
+	streamRaw, _ := json.Marshal(map[string]interface{}{
+		"network": "tcp", "security": "reality",
+		"realitySettings": map[string]interface{}{"publicKey": reality.PublicKey, "serverName": reality.ServerName, "shortId": reality.ShortID, "fingerprint": "chrome"},
+	})
 
 	// Replace or append relay outbound.
 	replaced := false
@@ -922,9 +989,12 @@ func (m *Manager) RemoveRelayOutbound(outboundTag, clientInboundTag string) erro
 	return m.write(cfg)
 }
 
-// AddRelayInbound adds a plain VLESS inbound on port that accepts relay traffic
+// AddRelayInbound adds an encrypted VLESS REALITY inbound that accepts relay traffic
 // from the entry server. Call reload after this.
-func (m *Manager) AddRelayInbound(tag string, port int, relayUUID string) error {
+func (m *Manager) AddRelayInbound(tag string, port int, relayUUID string, reality RelayRealityConfig) error {
+	if err := reality.validate(false); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -942,11 +1012,11 @@ func (m *Manager) AddRelayInbound(tag string, port int, relayUUID string) error 
 	}
 
 	settings := VlessInboundSettings{
-		Clients:    []VlessClient{{ID: relayUUID, Email: "relay-" + tag, Enable: true}},
+		Clients:    []VlessClient{{ID: relayUUID, Email: "relay-" + tag, Enable: true, ShortId: reality.ShortID}},
 		Decryption: "none",
 	}
 	settingsRaw, _ := json.Marshal(settings)
-	streamRaw, _ := json.Marshal(map[string]interface{}{"network": "tcp", "security": "none"})
+	streamRaw, _ := json.Marshal(RealityStreamSettings{Network: "tcp", Security: "reality", RealitySettings: RealitySettings{PrivateKey: reality.PrivateKey, ServerNames: []string{reality.ServerName}, ShortIds: []string{reality.ShortID}, Dest: reality.Dest}})
 
 	filtered = append(filtered, Inbound{
 		Tag:            tag,
