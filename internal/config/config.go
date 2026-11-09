@@ -7,18 +7,26 @@ import (
 
 type Config struct {
 	// Agent
-	ListenAddr  string `json:"listen_addr"`  // :7070
-	AgentToken  string `json:"agent_token"`  // secret shared with backend
-	TLSCert     string `json:"tls_cert"`     // optional path to cert.pem
-	TLSKey      string `json:"tls_key"`      // optional path to key.pem
+	ListenAddr string `json:"listen_addr"` // :7070
+	AgentToken string `json:"agent_token"` // secret shared with backend
+	TLSCert    string `json:"tls_cert"`    // optional path to cert.pem
+	TLSKey     string `json:"tls_key"`     // optional path to key.pem
 
 	// Xray
-	XrayBin     string `json:"xray_bin"`     // /usr/local/bin/xray
-	XrayConfig  string `json:"xray_config"`  // /etc/xray/config.json
+	XrayBin     string `json:"xray_bin"`      // /usr/local/bin/xray
+	XrayConfig  string `json:"xray_config"`   // /etc/xray/config.json
 	XrayAPIAddr string `json:"xray_api_addr"` // 127.0.0.1:10085 (gRPC API)
 
 	// Server identity
-	ServerName  string `json:"server_name"`
+	ServerName string `json:"server_name"`
+
+	// Local bindings behind an SNI proxy; API ports remain public-facing.
+	InboundBindings map[string]InboundBinding `json:"inbound_bindings,omitempty"`
+}
+
+type InboundBinding struct {
+	Listen string `json:"listen"`
+	Port   int    `json:"port"`
 }
 
 func Load(path string) (*Config, error) {
@@ -48,10 +56,22 @@ func Load(path string) (*Config, error) {
 }
 
 func applyEnv(c *Config) {
-	if v := os.Getenv("AGENT_TOKEN");     v != "" { c.AgentToken = v }
-	if v := os.Getenv("AGENT_ADDR");      v != "" { c.ListenAddr = v }
-	if v := os.Getenv("XRAY_BIN");        v != "" { c.XrayBin = v }
-	if v := os.Getenv("XRAY_CONFIG");     v != "" { c.XrayConfig = v }
-	if v := os.Getenv("XRAY_API_ADDR");   v != "" { c.XrayAPIAddr = v }
-	if v := os.Getenv("SERVER_NAME");     v != "" { c.ServerName = v }
+	if v := os.Getenv("AGENT_TOKEN"); v != "" {
+		c.AgentToken = v
+	}
+	if v := os.Getenv("AGENT_ADDR"); v != "" {
+		c.ListenAddr = v
+	}
+	if v := os.Getenv("XRAY_BIN"); v != "" {
+		c.XrayBin = v
+	}
+	if v := os.Getenv("XRAY_CONFIG"); v != "" {
+		c.XrayConfig = v
+	}
+	if v := os.Getenv("XRAY_API_ADDR"); v != "" {
+		c.XrayAPIAddr = v
+	}
+	if v := os.Getenv("SERVER_NAME"); v != "" {
+		c.ServerName = v
+	}
 }

@@ -78,6 +78,22 @@ func (s *Server) Run() error {
 	return srv.ListenAndServe()
 }
 
+// applyConfig restores the last on-disk backup if validation/startup fails.
+func (s *Server) applyConfig() error {
+	if err := s.process.Reload(); err != nil {
+		if rollbackErr := s.manager.Rollback(); rollbackErr != nil {
+			return fmt.Errorf("configuration rejected; rollback failed: %w", rollbackErr)
+		}
+		if !s.process.IsRunning() {
+			if restartErr := s.process.Reload(); restartErr != nil {
+				return fmt.Errorf("previous configuration restored but startup failed: %w", restartErr)
+			}
+		}
+		return fmt.Errorf("configuration rejected; previous configuration restored: %w", err)
+	}
+	return nil
+}
+
 // ── Auth middleware ────────────────────────────────────────────────────────────
 
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
@@ -180,7 +196,7 @@ func (s *Server) handleXrayReload(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, 405, "method not allowed")
 		return
 	}
-	if err := s.process.Reload(); err != nil {
+	if err := s.applyConfig(); err != nil {
 		jsonErr(w, 500, err.Error())
 		return
 	}
@@ -287,7 +303,7 @@ func (s *Server) handleAddClient(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, resp)
 		return
 	}
-	if err := s.process.Reload(); err != nil {
+	if err := s.applyConfig(); err != nil {
 		resp["config_apply_state"] = "failed"
 		resp["config_error"] = err.Error()
 		log.Printf("xray reload after add client failed: %v", err)
@@ -355,7 +371,7 @@ func (s *Server) handleRemoveClient(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, resp)
 		return
 	}
-	if err := s.process.Reload(); err != nil {
+	if err := s.applyConfig(); err != nil {
 		resp["config_apply_state"] = "failed"
 		resp["config_error"] = err.Error()
 		log.Printf("xray reload after remove client failed: %v", err)
@@ -392,7 +408,7 @@ func (s *Server) handleUpdateClient(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.process.Reload(); err != nil {
+	if err := s.applyConfig(); err != nil {
 		log.Printf("xray apply after update client failed: %v", err)
 		jsonErr(w, http.StatusBadGateway, "client updated, but xray apply failed: "+err.Error())
 		return
@@ -432,12 +448,20 @@ func (s *Server) handleEnsureInbound(w http.ResponseWriter, r *http.Request) {
 		transport = "tcp"
 	}
 
-	if err := s.manager.EnsureRealityInbound(req.Tag, req.Port, req.PrivateKey, req.ShortIDs, req.ServerNames, req.Dest, transport); err != nil {
+	port, listen := req.Port, ""
+	if binding, ok := s.cfg.InboundBindings[req.Tag]; ok {
+		if binding.Port < 1 || binding.Port > 65535 {
+			jsonErr(w, 500, "invalid local inbound binding")
+			return
+		}
+		port, listen = binding.Port, binding.Listen
+	}
+	if err := s.manager.EnsureRealityInbound(req.Tag, port, req.PrivateKey, req.ShortIDs, req.ServerNames, req.Dest, transport, listen); err != nil {
 		jsonErr(w, 500, err.Error())
 		return
 	}
 
-	if err := s.process.Reload(); err != nil {
+	if err := s.applyConfig(); err != nil {
 		log.Printf("xray apply after ensure inbound failed: %v", err)
 		jsonErr(w, http.StatusBadGateway, "inbound saved, but xray apply failed: "+err.Error())
 		return
@@ -479,7 +503,7 @@ func (s *Server) handleUpdateShortIds(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, 500, err.Error())
 		return
 	}
-	if err := s.process.Reload(); err != nil {
+	if err := s.applyConfig(); err != nil {
 		jsonErr(w, http.StatusBadGateway, "shortIds saved, but xray apply failed: "+err.Error())
 		return
 	}
@@ -529,13 +553,13 @@ func (s *Server) handleApplyRouting(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, 500, err.Error())
 		return
 	}
-	if err := s.process.Reload(); err != nil {
+	if err := s.applyConfig(); err != nil {
 		reloadErr := err
 		if rbErr := s.manager.Rollback(); rbErr != nil {
 			jsonErr(w, http.StatusBadGateway, "routing saved, but xray reload failed and rollback failed: "+reloadErr.Error()+"; rollback: "+rbErr.Error())
 			return
 		}
-		if restoreErr := s.process.Reload(); restoreErr != nil {
+		if restoreErr := s.applyConfig(); restoreErr != nil {
 			jsonErr(w, http.StatusBadGateway, "routing rejected, previous config restored, but xray restart failed: "+reloadErr.Error()+"; restore: "+restoreErr.Error())
 			return
 		}
@@ -555,7 +579,7 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, 500, err.Error())
 		return
 	}
-	if err := s.process.Reload(); err != nil {
+	if err := s.applyConfig(); err != nil {
 		jsonErr(w, http.StatusBadGateway, "rollback applied, but xray reload failed: "+err.Error())
 		return
 	}
@@ -626,12 +650,24 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cfg := xray.DefaultConfig(req.PrivateKey, req.ShortIDs, serverNames, dest, req.Port, transport)
+	for i := range cfg.Inbounds {
+		if cfg.Inbounds[i].Tag == "darkline-reality" {
+			cfg.Inbounds[i].Tag = tag
+			if binding, ok := s.cfg.InboundBindings[tag]; ok {
+				if binding.Port < 1 || binding.Port > 65535 {
+					jsonErr(w, 500, "invalid local inbound binding")
+					return
+				}
+				cfg.Inbounds[i].Port, cfg.Inbounds[i].Listen = binding.Port, binding.Listen
+			}
+		}
+	}
 	if err := s.manager.WriteConfig(cfg); err != nil {
 		jsonErr(w, 500, "write config: "+err.Error())
 		return
 	}
 
-	if err := s.process.Restart(); err != nil {
+	if err := s.applyConfig(); err != nil {
 		jsonErr(w, http.StatusBadGateway, "config written, but xray start failed: "+err.Error())
 		return
 	}
@@ -649,11 +685,12 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 // POST /relay/outbound/setup — add VLESS outbound to worker + routing rule on entry.
 type RelayOutboundSetupReq struct {
-	OutboundTag      string `json:"outbound_tag"`
-	ClientInboundTag string `json:"client_inbound_tag"`
-	WorkerIP         string `json:"worker_ip"`
-	WorkerPort       int    `json:"worker_port"`
-	RelayUUID        string `json:"relay_uuid"`
+	Reality          xray.RelayRealityConfig `json:"reality"`
+	OutboundTag      string                  `json:"outbound_tag"`
+	ClientInboundTag string                  `json:"client_inbound_tag"`
+	WorkerIP         string                  `json:"worker_ip"`
+	WorkerPort       int                     `json:"worker_port"`
+	RelayUUID        string                  `json:"relay_uuid"`
 }
 
 func (s *Server) handleRelayOutboundSetup(w http.ResponseWriter, r *http.Request) {
@@ -673,11 +710,11 @@ func (s *Server) handleRelayOutboundSetup(w http.ResponseWriter, r *http.Request
 	if req.ClientInboundTag == "" {
 		req.ClientInboundTag = "darkline-reality"
 	}
-	if err := s.manager.AddRelayOutbound(req.OutboundTag, req.ClientInboundTag, req.WorkerIP, req.WorkerPort, req.RelayUUID); err != nil {
+	if err := s.manager.AddRelayOutbound(req.OutboundTag, req.ClientInboundTag, req.WorkerIP, req.WorkerPort, req.RelayUUID, req.Reality); err != nil {
 		jsonErr(w, 500, err.Error())
 		return
 	}
-	if err := s.process.Reload(); err != nil {
+	if err := s.applyConfig(); err != nil {
 		jsonErr(w, http.StatusBadGateway, "relay outbound saved, but xray reload failed: "+err.Error())
 		return
 	}
@@ -711,7 +748,7 @@ func (s *Server) handleRelayOutboundRemove(w http.ResponseWriter, r *http.Reques
 		jsonErr(w, 500, err.Error())
 		return
 	}
-	if err := s.process.Reload(); err != nil {
+	if err := s.applyConfig(); err != nil {
 		jsonErr(w, http.StatusBadGateway, "relay outbound removed, but xray reload failed: "+err.Error())
 		return
 	}
@@ -749,18 +786,19 @@ func (s *Server) handleRelayBalancerSetup(w http.ResponseWriter, r *http.Request
 		jsonErr(w, 500, err.Error())
 		return
 	}
-	if err := s.process.Reload(); err != nil {
+	if err := s.applyConfig(); err != nil {
 		jsonErr(w, http.StatusBadGateway, "relay balancer saved, but xray reload failed: "+err.Error())
 		return
 	}
 	jsonOK(w, map[string]interface{}{"ok": true, "balancer_tag": req.BalancerTag, "outbound_tags": req.OutboundTags})
 }
 
-// POST /relay/inbound/setup — add plain VLESS inbound on worker for relay traffic.
+// POST /relay/inbound/setup — add encrypted VLESS REALITY inbound on worker.
 type RelayInboundSetupReq struct {
-	InboundTag string `json:"inbound_tag"`
-	Port       int    `json:"port"`
-	RelayUUID  string `json:"relay_uuid"`
+	Reality    xray.RelayRealityConfig `json:"reality"`
+	InboundTag string                  `json:"inbound_tag"`
+	Port       int                     `json:"port"`
+	RelayUUID  string                  `json:"relay_uuid"`
 }
 
 func (s *Server) handleRelayInboundSetup(w http.ResponseWriter, r *http.Request) {
@@ -777,11 +815,11 @@ func (s *Server) handleRelayInboundSetup(w http.ResponseWriter, r *http.Request)
 		jsonErr(w, 400, "inbound_tag, port, relay_uuid are required")
 		return
 	}
-	if err := s.manager.AddRelayInbound(req.InboundTag, req.Port, req.RelayUUID); err != nil {
+	if err := s.manager.AddRelayInbound(req.InboundTag, req.Port, req.RelayUUID, req.Reality); err != nil {
 		jsonErr(w, 500, err.Error())
 		return
 	}
-	if err := s.process.Reload(); err != nil {
+	if err := s.applyConfig(); err != nil {
 		jsonErr(w, http.StatusBadGateway, "relay inbound saved, but xray reload failed: "+err.Error())
 		return
 	}
@@ -811,7 +849,7 @@ func (s *Server) handleRelayInboundRemove(w http.ResponseWriter, r *http.Request
 		jsonErr(w, 500, err.Error())
 		return
 	}
-	if err := s.process.Reload(); err != nil {
+	if err := s.applyConfig(); err != nil {
 		jsonErr(w, http.StatusBadGateway, "relay inbound removed, but xray reload failed: "+err.Error())
 		return
 	}

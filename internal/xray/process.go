@@ -16,6 +16,7 @@ type Process struct {
 	mu      sync.Mutex
 	cfg     *config.Config
 	cmd     *exec.Cmd
+	done    chan struct{}
 	started time.Time
 }
 
@@ -41,8 +42,19 @@ func (p *Process) Start() error {
 	}
 
 	p.cmd = cmd
+	done := make(chan struct{})
+	p.done = done
+	go func() {
+		_ = cmd.Wait()
+		close(done)
+	}()
 	p.started = time.Now()
-	return nil
+	select {
+	case <-done:
+		return fmt.Errorf("xray exited during startup")
+	case <-time.After(200 * time.Millisecond):
+		return nil
+	}
 }
 
 func (p *Process) Stop() error {
@@ -64,7 +76,7 @@ func (p *Process) Stop() error {
 
 	// The process may already be reaped or return an exit status after SIGTERM;
 	// both are normal during a controlled restart.
-	_ = cmd.Wait()
+	<-p.done
 	p.cmd = nil
 	p.started = time.Time{}
 	return nil
@@ -72,6 +84,10 @@ func (p *Process) Stop() error {
 
 // Restart safely applies an updated config by starting a fresh Xray process.
 func (p *Process) Restart() error {
+	// Reject bad configuration before stopping a healthy process.
+	if err := exec.Command(p.cfg.XrayBin, "run", "-test", "-c", p.cfg.XrayConfig).Run(); err != nil {
+		return fmt.Errorf("xray configuration validation failed: %w", err)
+	}
 	if err := p.Stop(); err != nil {
 		return err
 	}
@@ -94,6 +110,13 @@ func (p *Process) IsRunning() bool {
 func (p *Process) runningLocked() bool {
 	if p.cmd == nil || p.cmd.Process == nil {
 		return false
+	}
+	select {
+	case <-p.done:
+		p.cmd = nil
+		p.started = time.Time{}
+		return false
+	default:
 	}
 	if err := p.cmd.Process.Signal(syscall.Signal(0)); err != nil {
 		p.cmd = nil
