@@ -13,12 +13,13 @@ import (
 // ── Xray config types ──────────────────────────────────────────────────────
 
 type Config struct {
-	Log       *LogConfig     `json:"log,omitempty"`
-	API       *APIConfig     `json:"api,omitempty"`
-	Inbounds  []Inbound      `json:"inbounds"`
-	Outbounds []Outbound     `json:"outbounds"`
-	Policy    *PolicyConfig  `json:"policy,omitempty"`
-	Routing   *RoutingConfig `json:"routing,omitempty"`
+	Log         *LogConfig         `json:"log,omitempty"`
+	API         *APIConfig         `json:"api,omitempty"`
+	Inbounds    []Inbound          `json:"inbounds"`
+	Outbounds   []Outbound         `json:"outbounds"`
+	Policy      *PolicyConfig      `json:"policy,omitempty"`
+	Routing     *RoutingConfig     `json:"routing,omitempty"`
+	Observatory *ObservatoryConfig `json:"observatory,omitempty"`
 }
 
 type LogConfig struct {
@@ -56,8 +57,21 @@ type RoutingConfig struct {
 }
 
 type Balancer struct {
-	Tag      string   `json:"tag"`
-	Selector []string `json:"selector"`
+	Tag         string            `json:"tag"`
+	Selector    []string          `json:"selector"`
+	FallbackTag string            `json:"fallbackTag,omitempty"`
+	Strategy    *BalancerStrategy `json:"strategy,omitempty"`
+}
+
+type BalancerStrategy struct {
+	Type string `json:"type"`
+}
+
+type ObservatoryConfig struct {
+	SubjectSelector   []string `json:"subjectSelector"`
+	ProbeURL          string   `json:"probeUrl"`
+	ProbeInterval     string   `json:"probeInterval"`
+	EnableConcurrency bool     `json:"enableConcurrency"`
 }
 
 type RoutingRule struct {
@@ -194,6 +208,12 @@ func (m *Manager) write(cfg *Config) error {
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
+	return m.writeData(data)
+}
+
+// writeData preserves the existing backup and atomic replacement semantics.
+// The caller holds m.mu.
+func (m *Manager) writeData(data []byte) error {
 	// Backup existing config before overwriting.
 	if _, statErr := os.Stat(m.configPath); statErr == nil {
 		previous, err := os.ReadFile(m.configPath)
@@ -778,14 +798,18 @@ func DefaultConfig(privateKey string, shortIDs []string, serverNames []string, d
 
 // RelayRealityConfig keeps inter-server VPN transport encrypted with REALITY.
 type RelayRealityConfig struct {
-	PrivateKey string `json:"private_key,omitempty"`
-	PublicKey  string `json:"public_key,omitempty"`
-	ServerName string `json:"server_name"`
-	ShortID    string `json:"short_id"`
-	Dest       string `json:"dest,omitempty"`
+	PrivateKey  string `json:"private_key,omitempty"`
+	PublicKey   string `json:"public_key,omitempty"`
+	ServerName  string `json:"server_name"`
+	ShortID     string `json:"short_id"`
+	Dest        string `json:"dest,omitempty"`
+	Fingerprint string `json:"fingerprint,omitempty"`
 }
 
 func (r RelayRealityConfig) validate(outbound bool) error {
+	if r.Fingerprint != "" && !validFingerprint(r.Fingerprint) {
+		return fmt.Errorf("unsupported REALITY fingerprint")
+	}
 	if r.ServerName == "" || r.ShortID == "" {
 		return fmt.Errorf("REALITY server_name and short_id are required")
 	}
@@ -829,9 +853,13 @@ func (m *Manager) AddRelayOutbound(outboundTag, clientInboundTag, workerIP strin
 		}},
 	}
 	obSettingsRaw, _ := json.Marshal(obSettings)
+	fingerprint := reality.Fingerprint
+	if fingerprint == "" {
+		fingerprint = "chrome"
+	}
 	streamRaw, _ := json.Marshal(map[string]interface{}{
 		"network": "tcp", "security": "reality",
-		"realitySettings": map[string]interface{}{"publicKey": reality.PublicKey, "serverName": reality.ServerName, "shortId": reality.ShortID, "fingerprint": "chrome"},
+		"realitySettings": map[string]interface{}{"publicKey": reality.PublicKey, "serverName": reality.ServerName, "shortId": reality.ShortID, "fingerprint": fingerprint},
 	})
 
 	// Replace or append relay outbound.
@@ -922,8 +950,43 @@ func (m *Manager) SetRelayBalancer(balancerTag, clientInboundTag string, outboun
 			balancers = append(balancers, balancer)
 		}
 	}
-	balancers = append(balancers, Balancer{Tag: balancerTag, Selector: selectors})
+	// Probe the complete relay path, rather than the management agent. A
+	// reachable agent does not imply that its VPN exit can reach the Internet.
+	// Never fall back to a direct exit when every relay is unavailable.
+	blocked := false
+	for _, outbound := range cfg.Outbounds {
+		if outbound.Tag == "blocked" {
+			if outbound.Protocol != "blackhole" {
+				return fmt.Errorf("blocked fallback must use blackhole protocol")
+			}
+			blocked = true
+		}
+	}
+	if !blocked {
+		cfg.Outbounds = append(cfg.Outbounds, Outbound{Tag: "blocked", Protocol: "blackhole"})
+	}
+	balancers = append(balancers, Balancer{Tag: balancerTag, Selector: selectors,
+		FallbackTag: "blocked", Strategy: &BalancerStrategy{Type: "leastPing"}})
 	cfg.Routing.Balancers = balancers
+	if cfg.Observatory == nil {
+		cfg.Observatory = &ObservatoryConfig{
+			ProbeURL:      "https://www.gstatic.com/generate_204",
+			ProbeInterval: "10s", EnableConcurrency: true,
+		}
+	}
+	// Keep probes for other inbound pools as well as this one.
+	for _, tag := range selectors {
+		found := false
+		for _, existing := range cfg.Observatory.SubjectSelector {
+			if existing == tag {
+				found = true
+				break
+			}
+		}
+		if !found {
+			cfg.Observatory.SubjectSelector = append(cfg.Observatory.SubjectSelector, tag)
+		}
+	}
 
 	newRules := []RoutingRule{}
 	for _, rule := range cfg.Routing.Rules {

@@ -53,6 +53,7 @@ func (s *Server) Run() error {
 	mux.HandleFunc("/relay/outbound/setup", s.auth(s.handleRelayOutboundSetup))
 	mux.HandleFunc("/relay/outbound/remove", s.auth(s.handleRelayOutboundRemove))
 	mux.HandleFunc("/relay/balancer/setup", s.auth(s.handleRelayBalancerSetup))
+	mux.HandleFunc("/relay/fingerprints", s.auth(s.handleRelayFingerprints))
 	mux.HandleFunc("/relay/inbound/setup", s.auth(s.handleRelayInboundSetup))
 	mux.HandleFunc("/relay/inbound/remove", s.auth(s.handleRelayInboundRemove))
 

@@ -316,3 +316,76 @@ func TestEnsureInboundCanBindBehindSNIProxy(t *testing.T) {
 	}
 	t.Fatal("proxied inbound not found")
 }
+
+func TestRelayBalancerObservesAllPoolsAndFailsClosed(t *testing.T) {
+	path := makeTestConfig(t, nil)
+	m := NewManager(path)
+	if err := m.SetRelayBalancer("pool-a", "entry-a", []string{"relay-a", "relay-b", "relay-a"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SetRelayBalancer("pool-b", "entry-b", []string{"relay-c"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SetRelayBalancer("pool-a", "entry-a", []string{"relay-a", "relay-b"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := m.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Observatory == nil || !cfg.Observatory.EnableConcurrency || cfg.Observatory.ProbeInterval != "10s" {
+		t.Fatal("missing concurrent relay probes")
+	}
+	for _, tag := range []string{"relay-a", "relay-b", "relay-c"} {
+		if !slices.Contains(cfg.Observatory.SubjectSelector, tag) {
+			t.Fatalf("unobserved relay %s", tag)
+		}
+	}
+	if len(cfg.Routing.Balancers) != 2 {
+		t.Fatal("pool duplication")
+	}
+	for _, b := range cfg.Routing.Balancers {
+		if b.FallbackTag != "blocked" || b.Strategy == nil || b.Strategy.Type != "leastPing" {
+			t.Fatal("unhealthy relay or direct fallback possible")
+		}
+	}
+	blocked := 0
+	for _, o := range cfg.Outbounds {
+		if o.Tag == "blocked" && o.Protocol == "blackhole" {
+			blocked++
+		}
+	}
+	if blocked != 1 {
+		t.Fatal("invalid failure fallback")
+	}
+	if len(cfg.Inbounds) != 1 || cfg.Inbounds[0].Tag != "test-reality" {
+		t.Fatal("client inbound changed")
+	}
+}
+
+func TestRelayBalancerRejectsDirectFallbackCollision(t *testing.T) {
+	path := makeTestConfig(t, nil)
+	m := NewManager(path)
+	cfg, err := m.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Outbounds = []Outbound{{Tag: "blocked", Protocol: "freedom"}}
+	if err := m.write(cfg); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SetRelayBalancer("pool", "entry", []string{"relay"}); err == nil {
+		t.Fatal("accepted unsafe fallback")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("failed validation modified configuration")
+	}
+}
