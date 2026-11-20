@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
+	"strings"
 	"sync"
 )
 
@@ -20,6 +22,7 @@ type Config struct {
 	Policy      *PolicyConfig      `json:"policy,omitempty"`
 	Routing     *RoutingConfig     `json:"routing,omitempty"`
 	Observatory *ObservatoryConfig `json:"observatory,omitempty"`
+	DNS         json.RawMessage    `json:"dns,omitempty"`
 }
 
 type LogConfig struct {
@@ -395,7 +398,7 @@ func (m *Manager) ApplyRoutingRules(rules []RoutingRule) error {
 
 	next = append(next, relayRules...)
 
-	cfg.Routing.Rules = next
+	cfg.Routing.Rules = orderManagedRelayCatchalls(next)
 	return m.write(cfg)
 }
 
@@ -893,23 +896,21 @@ func (m *Manager) AddRelayOutbound(outboundTag, clientInboundTag, workerIP strin
 		// Remove only the previously managed relay rule for this inbound.
 		// User direct/blocked rules for the same inbound must stay before the
 		// catchall relay rule so RU/private/etc. can exit from the entry server.
-		isForThisInbound := false
-		for _, tag := range rule.InboundTag {
-			if tag == clientInboundTag {
-				isForThisInbound = true
-				break
+		if slices.Contains(rule.InboundTag, clientInboundTag) &&
+			(rule.BalancerTag != "" || !isSystemOutbound(rule.OutboundTag)) {
+			rule.InboundTag = slices.DeleteFunc(slices.Clone(rule.InboundTag), func(tag string) bool { return tag == clientInboundTag })
+			if len(rule.InboundTag) == 0 {
+				continue
 			}
 		}
-		if !(isForThisInbound && (rule.BalancerTag != "" || !isSystemOutbound(rule.OutboundTag))) {
-			newRules = append(newRules, rule)
-		}
+		newRules = append(newRules, rule)
 	}
 	newRules = append(newRules, RoutingRule{
 		Type:        "field",
 		InboundTag:  []string{clientInboundTag},
 		OutboundTag: outboundTag,
 	})
-	cfg.Routing.Rules = newRules
+	cfg.Routing.Rules = orderManagedRelayCatchalls(newRules)
 
 	return m.write(cfg)
 }
@@ -990,30 +991,60 @@ func (m *Manager) SetRelayBalancer(balancerTag, clientInboundTag string, outboun
 
 	newRules := []RoutingRule{}
 	for _, rule := range cfg.Routing.Rules {
-		isForThisInbound := false
-		for _, tag := range rule.InboundTag {
-			if tag == clientInboundTag {
-				isForThisInbound = true
-				break
+		if slices.Contains(rule.InboundTag, clientInboundTag) &&
+			(rule.BalancerTag != "" || !isSystemOutbound(rule.OutboundTag)) {
+			rule.InboundTag = slices.DeleteFunc(slices.Clone(rule.InboundTag), func(tag string) bool { return tag == clientInboundTag })
+			if len(rule.InboundTag) == 0 {
+				continue
 			}
 		}
-		if !(isForThisInbound && (rule.BalancerTag != "" || !isSystemOutbound(rule.OutboundTag))) {
-			newRules = append(newRules, rule)
-		}
+		newRules = append(newRules, rule)
 	}
 	newRules = append(newRules, RoutingRule{
 		Type:        "field",
 		InboundTag:  []string{clientInboundTag},
 		BalancerTag: balancerTag,
 	})
-	cfg.Routing.Rules = newRules
+	cfg.Routing.Rules = orderManagedRelayCatchalls(newRules)
 
 	return m.write(cfg)
 }
 
-// RemoveRelayOutbound removes the relay outbound and restores direct routing
-// for clientInboundTag. Call reload after this.
+// relayUnavailableTag is a managed route, so later relay setup can replace it
+// and ApplyRoutingRules preserves it while updating domain/IP exceptions.
+const relayUnavailableTag = "relay-unavailable"
+
+// A direct catchall must not override a managed relay catchall. Scoped
+// exceptions that precede the direct catchall retain priority.
+func orderManagedRelayCatchalls(rules []RoutingRule) []RoutingRule {
+	for i, relay := range rules {
+		if len(relay.InboundTag) == 0 || len(relay.Domain)+len(relay.IP)+len(relay.Protocol) != 0 ||
+			(relay.OutboundTag != relayUnavailableTag && !strings.HasPrefix(relay.OutboundTag, "relay-out-") && relay.BalancerTag == "") {
+			continue
+		}
+		for j, prior := range rules[:i] {
+			if prior.OutboundTag != "direct" || len(prior.Domain)+len(prior.IP)+len(prior.Protocol) != 0 {
+				continue
+			}
+			if len(prior.InboundTag) != 0 && !slices.ContainsFunc(relay.InboundTag, func(tag string) bool {
+				return slices.Contains(prior.InboundTag, tag)
+			}) {
+				continue
+			}
+			copy(rules[j+1:i+1], rules[j:i])
+			rules[j] = relay
+			break
+		}
+	}
+	return rules
+}
+
+// RemoveRelayOutbound prunes the outbound and its references in one write.
+// A client inbound with no relay route is explicitly blocked.
 func (m *Manager) RemoveRelayOutbound(outboundTag, clientInboundTag string) error {
+	if !strings.HasPrefix(outboundTag, "relay-out-") || clientInboundTag == "" {
+		return fmt.Errorf("expected a managed relay outbound and client inbound tag")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1022,33 +1053,64 @@ func (m *Manager) RemoveRelayOutbound(outboundTag, clientInboundTag string) erro
 		return err
 	}
 
-	// Remove the relay outbound.
-	filtered := make([]Outbound, 0, len(cfg.Outbounds))
+	cfg.Outbounds = slices.DeleteFunc(cfg.Outbounds, func(ob Outbound) bool { return ob.Tag == outboundTag })
+	if cfg.Routing == nil {
+		cfg.Routing = &RoutingConfig{}
+	}
+
+	// Xray selectors match prefixes. Keep a shared prefix if another outbound
+	// still matches it.
+	orphaned := func(selector string) bool {
+		return strings.HasPrefix(outboundTag, selector) && !slices.ContainsFunc(cfg.Outbounds, func(ob Outbound) bool {
+			return strings.HasPrefix(ob.Tag, selector)
+		})
+	}
+	removedPools := map[string]bool{}
+	for i := range cfg.Routing.Balancers {
+		pool := &cfg.Routing.Balancers[i]
+		pool.Selector = slices.DeleteFunc(pool.Selector, orphaned)
+		if len(pool.Selector) == 0 {
+			removedPools[pool.Tag] = true
+		}
+		if pool.FallbackTag == outboundTag {
+			pool.FallbackTag = relayUnavailableTag
+		}
+	}
+	cfg.Routing.Balancers = slices.DeleteFunc(cfg.Routing.Balancers, func(pool Balancer) bool { return removedPools[pool.Tag] })
+	if cfg.Observatory != nil {
+		cfg.Observatory.SubjectSelector = slices.DeleteFunc(cfg.Observatory.SubjectSelector, orphaned)
+		if len(cfg.Observatory.SubjectSelector) == 0 {
+			cfg.Observatory = nil
+		}
+	}
+
+	hasRelayCatchall := false
+	for i := range cfg.Routing.Rules {
+		rule := &cfg.Routing.Rules[i]
+		if rule.OutboundTag == outboundTag || removedPools[rule.BalancerTag] {
+			rule.OutboundTag, rule.BalancerTag = relayUnavailableTag, ""
+		}
+		if slices.Contains(rule.InboundTag, clientInboundTag) &&
+			len(rule.Domain)+len(rule.IP)+len(rule.Protocol) == 0 &&
+			(rule.BalancerTag != "" || !isSystemOutbound(rule.OutboundTag)) {
+			hasRelayCatchall = true
+		}
+	}
+	if !hasRelayCatchall {
+		cfg.Routing.Rules = append(cfg.Routing.Rules, RoutingRule{
+			Type: "field", InboundTag: []string{clientInboundTag}, OutboundTag: relayUnavailableTag,
+		})
+	}
+	cfg.Routing.Rules = orderManagedRelayCatchalls(cfg.Routing.Rules)
 	for _, ob := range cfg.Outbounds {
-		if ob.Tag != outboundTag {
-			filtered = append(filtered, ob)
+		if ob.Tag == relayUnavailableTag {
+			if ob.Protocol != "blackhole" {
+				return fmt.Errorf("%s fallback must use blackhole protocol", relayUnavailableTag)
+			}
+			return m.write(cfg)
 		}
 	}
-	cfg.Outbounds = filtered
-
-	// Remove routing rule for clientInboundTag (falls back to default direct).
-	if cfg.Routing != nil {
-		newRules := []RoutingRule{}
-		for _, rule := range cfg.Routing.Rules {
-			isForThisInbound := false
-			for _, tag := range rule.InboundTag {
-				if tag == clientInboundTag {
-					isForThisInbound = true
-					break
-				}
-			}
-			if !(isForThisInbound && (rule.BalancerTag != "" || !isSystemOutbound(rule.OutboundTag))) {
-				newRules = append(newRules, rule)
-			}
-		}
-		cfg.Routing.Rules = newRules
-	}
-
+	cfg.Outbounds = append(cfg.Outbounds, Outbound{Tag: relayUnavailableTag, Protocol: "blackhole"})
 	return m.write(cfg)
 }
 
@@ -1115,7 +1177,7 @@ func (m *Manager) AddRelayInbound(tag string, port int, relayUUID string, realit
 		InboundTag:  []string{tag},
 		OutboundTag: "direct",
 	})
-	cfg.Routing.Rules = newRules
+	cfg.Routing.Rules = orderManagedRelayCatchalls(newRules)
 
 	return m.write(cfg)
 }

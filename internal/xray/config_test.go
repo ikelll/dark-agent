@@ -363,6 +363,97 @@ func TestRelayBalancerObservesAllPoolsAndFailsClosed(t *testing.T) {
 	}
 }
 
+func TestRoutingUpdatePreservesDNS(t *testing.T) {
+	m := NewManager(makeTestConfig(t, nil))
+	cfg, err := m.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.DNS = json.RawMessage(`{"servers":["localhost"]}`)
+	if err := m.write(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ApplyRoutingRules(nil); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = m.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dns struct{ Servers []string }
+	if err := json.Unmarshal(cfg.DNS, &dns); err != nil || !slices.Equal(dns.Servers, []string{"localhost"}) {
+		t.Fatal("routing update lost DNS settings")
+	}
+}
+
+func TestRemoveRelayOutboundKeepsPoolThenBlocks(t *testing.T) {
+	m := NewManager(makeTestConfig(t, nil))
+	cfg, err := m.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Outbounds = append(cfg.Outbounds,
+		Outbound{Tag: "relay-out-a", Protocol: "vless"},
+		Outbound{Tag: "relay-out-b", Protocol: "vless"},
+	)
+	if err := m.write(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SetRelayBalancer("pool", "test-reality", []string{"relay-out-a", "relay-out-b"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RemoveRelayOutbound("relay-out-a", "test-reality"); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = m.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Routing.Balancers) != 1 || !slices.Equal(cfg.Routing.Balancers[0].Selector, []string{"relay-out-b"}) ||
+		cfg.Observatory == nil || !slices.Equal(cfg.Observatory.SubjectSelector, []string{"relay-out-b"}) {
+		t.Fatal("remaining relay was lost or stale references remain")
+	}
+	if cfg.Routing.Rules[len(cfg.Routing.Rules)-1].BalancerTag != "pool" {
+		t.Fatal("remaining pool route was removed")
+	}
+	for range 2 {
+		if err := m.RemoveRelayOutbound("relay-out-b", "test-reality"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := m.ApplyRoutingRules([]RoutingRule{
+		{InboundTag: []string{"test-reality"}, Domain: []string{"domain:example.org"}, OutboundTag: "direct"},
+		{InboundTag: []string{"test-reality"}, OutboundTag: "direct"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = m.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Routing.Balancers) != 0 || cfg.Observatory != nil {
+		t.Fatal("empty relay pool or probes persisted")
+	}
+	if len(cfg.Routing.Rules) != 4 || cfg.Routing.Rules[1].OutboundTag != "direct" || len(cfg.Routing.Rules[1].Domain) != 1 || cfg.Routing.Rules[3].OutboundTag != "direct" {
+		t.Fatal("a scoped exception or direct catchall has incorrect priority")
+	}
+	rule := cfg.Routing.Rules[2]
+	if rule.OutboundTag != relayUnavailableTag || !slices.Equal(rule.InboundTag, []string{"test-reality"}) ||
+		!slices.ContainsFunc(cfg.Outbounds, func(ob Outbound) bool { return ob.Tag == rule.OutboundTag && ob.Protocol == "blackhole" }) {
+		t.Fatal("client inbound can fall through to direct")
+	}
+	if err := m.SetRelayBalancer("pool", "test-reality", []string{"relay-out-restored"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = m.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Routing.Rules) != 4 || cfg.Routing.Rules[2].BalancerTag != "pool" || cfg.Routing.Rules[3].OutboundTag != "direct" {
+		t.Fatal("restored relay pool did not replace the managed block ahead of direct")
+	}
+}
+
 func TestRelayBalancerRejectsDirectFallbackCollision(t *testing.T) {
 	path := makeTestConfig(t, nil)
 	m := NewManager(path)
